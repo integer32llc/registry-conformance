@@ -10,15 +10,21 @@ use tokio::{fs, process::Command};
 type BoxError = Box<dyn snafu::Error + Send + Sync + 'static>;
 
 pub async fn test_conformance<R: Registry + Send + Sync + 'static>() -> ExitCode {
-    let r = wrap_test::<R, _>(|a, b| basic_test(a, b).boxed()).await;
+    let name_length_1 = wrap_test::<R, _>(|a, b| name_length_1(a, b).boxed()).await;
+    let name_length_2 = wrap_test::<R, _>(|a, b| name_length_2(a, b).boxed()).await;
+    let name_length_3 = wrap_test::<R, _>(|a, b| name_length_3(a, b).boxed()).await;
+    let name_length_4 = wrap_test::<R, _>(|a, b| name_length_4(a, b).boxed()).await;
 
-    match r {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
+    let mut exit_code = ExitCode::SUCCESS;
+
+    for test in [name_length_1, name_length_2, name_length_3, name_length_4] {
+        if let Err(e) = test {
             eprintln!("{}", snafu::Report::from_error(e));
-            ExitCode::FAILURE
+            exit_code = ExitCode::FAILURE;
         }
     }
+
+    exit_code
 }
 
 async fn wrap_test<R, F>(f: F) -> Result<(), TestError>
@@ -61,8 +67,40 @@ enum TestError {
     RegistryShutdown { source: BoxError },
 }
 
-async fn basic_test(scratch: &ScratchSpace, registry: &mut impl Registry) -> Result<(), BoxError> {
-    let library_crate = Crate::new("the-library", "0.1.0")
+async fn name_length_1(
+    scratch: &ScratchSpace,
+    registry: &mut impl Registry,
+) -> Result<(), BoxError> {
+    parameterized_name(scratch, registry, "a").await
+}
+
+async fn name_length_2(
+    scratch: &ScratchSpace,
+    registry: &mut impl Registry,
+) -> Result<(), BoxError> {
+    parameterized_name(scratch, registry, "ab").await
+}
+
+async fn name_length_3(
+    scratch: &ScratchSpace,
+    registry: &mut impl Registry,
+) -> Result<(), BoxError> {
+    parameterized_name(scratch, registry, "abc").await
+}
+
+async fn name_length_4(
+    scratch: &ScratchSpace,
+    registry: &mut impl Registry,
+) -> Result<(), BoxError> {
+    parameterized_name(scratch, registry, "abcd").await
+}
+
+async fn parameterized_name(
+    scratch: &ScratchSpace,
+    registry: &mut impl Registry,
+    name: &str,
+) -> Result<(), BoxError> {
+    let library_crate = Crate::new(name, "0.1.0")
         .lib_rs("pub fn add(a: u8, b: u8) -> u8 { a + b }")
         .create_in(scratch)
         .await?;
@@ -72,8 +110,11 @@ async fn basic_test(scratch: &ScratchSpace, registry: &mut impl Registry) -> Res
 
     let usage_crate = Crate::new("the-binary", "0.1.0")
         .add_registry("mine", &registry_url)
-        .add_dependency("mine", "the-library", "0.1.0")
-        .main_rs("fn main() { assert_eq!(3, the_library::add(1, 2)); }")
+        .add_dependency("mine", &library_crate)
+        .main_rs(format!(
+            "fn main() {{ assert_eq!(3, {crate_name}::add(1, 2)); }}",
+            crate_name = library_crate.name,
+        ))
         .create_in(scratch)
         .await?;
 
@@ -189,16 +230,11 @@ impl Crate {
         self
     }
 
-    fn add_dependency(
-        mut self,
-        registry: impl Into<String>,
-        name: impl Into<String>,
-        version: impl Into<String>,
-    ) -> Self {
+    fn add_dependency(mut self, registry: impl Into<String>, crate_: &CreatedCrate) -> Self {
         self.cargo_toml.dependencies.insert(
-            name.into(),
+            crate_.name.clone(),
             cargo_toml::Dependency {
-                version: version.into(),
+                version: crate_.version.clone(),
                 registry: registry.into(),
             },
         );
