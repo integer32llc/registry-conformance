@@ -14,10 +14,18 @@ pub async fn test_conformance<R: Registry + Send + Sync + 'static>() -> ExitCode
     let name_length_2 = wrap_test::<R, _>(|a, b| name_length_2(a, b).boxed()).await;
     let name_length_3 = wrap_test::<R, _>(|a, b| name_length_3(a, b).boxed()).await;
     let name_length_4 = wrap_test::<R, _>(|a, b| name_length_4(a, b).boxed()).await;
+    let multiple_sibling_dependencies =
+        wrap_test::<R, _>(|a, b| multiple_sibling_dependencies(a, b).boxed()).await;
 
     let mut exit_code = ExitCode::SUCCESS;
 
-    for test in [name_length_1, name_length_2, name_length_3, name_length_4] {
+    for test in [
+        name_length_1,
+        name_length_2,
+        name_length_3,
+        name_length_4,
+        multiple_sibling_dependencies,
+    ] {
         if let Err(e) = test {
             eprintln!("{}", snafu::Report::from_error(e));
             exit_code = ExitCode::FAILURE;
@@ -115,6 +123,37 @@ async fn parameterized_name(
             "fn main() {{ assert_eq!(3, {crate_name}::add(1, 2)); }}",
             crate_name = library_crate.name,
         ))
+        .create_in(scratch)
+        .await?;
+
+    usage_crate.run().await?;
+
+    Ok(())
+}
+
+async fn multiple_sibling_dependencies(
+    scratch: &ScratchSpace,
+    registry: &mut impl Registry,
+) -> Result<(), BoxError> {
+    let left_crate = Crate::new("left", "0.1.0")
+        .lib_rs("pub fn add(a: u8, b: u8) -> u8 { a + b }")
+        .create_in(scratch)
+        .await?;
+    registry.publish_crate(&left_crate).await?;
+
+    let right_crate = Crate::new("right", "0.2.0")
+        .lib_rs("pub fn mul(a: u8, b: u8) -> u8 { a * b }")
+        .create_in(scratch)
+        .await?;
+    registry.publish_crate(&right_crate).await?;
+
+    let registry_url = registry.registry_url().await;
+
+    let usage_crate = Crate::new("the-binary", "0.1.0")
+        .add_registry("mine", &registry_url)
+        .add_dependency("mine", &left_crate)
+        .add_dependency("mine", &right_crate)
+        .main_rs("fn main() { assert_eq!(7, left::add(1, right::mul(2, 3))); }")
         .create_in(scratch)
         .await?;
 
