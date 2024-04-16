@@ -2,6 +2,7 @@
 #![deny(unused_crate_dependencies)]
 
 use futures::{future::BoxFuture, stream, FutureExt, StreamExt};
+use regex::Regex;
 use snafu::prelude::*;
 use std::{collections::BTreeMap, future::Future, path::PathBuf, process::ExitCode};
 use tempfile::TempDir;
@@ -14,12 +15,47 @@ struct TestDefinition<R: 'static> {
     f: Box<dyn for<'a> FnOnce(&'a ScratchSpace, &'a mut R) -> BoxFuture<'a, Result<(), BoxError>>>,
 }
 
+#[derive(Debug)]
 struct TestResult {
     name: &'static str,
-    result: Result<(), TestError>,
+    result: TestResultKind,
 }
 
-pub async fn test_conformance<R: Registry + Send + Sync + 'static>() -> ExitCode {
+#[derive(Debug)]
+enum TestResultKind {
+    Success,
+    Failure(TestError),
+    Skipped,
+}
+
+impl TestResultKind {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::Success => "PASS",
+            Self::Failure(_) => "FAIL",
+            Self::Skipped => "SKIP",
+        }
+    }
+}
+
+impl From<Result<(), TestError>> for TestResultKind {
+    fn from(value: Result<(), TestError>) -> Self {
+        match value {
+            Ok(()) => TestResultKind::Success,
+            Err(e) => TestResultKind::Failure(e),
+        }
+    }
+}
+
+pub async fn test_conformance<R: Registry + Send + Sync + 'static>(
+    mut args: impl Iterator<Item = String>,
+) -> ExitCode {
+    let selected_tests = match args.nth(1) {
+        Some(pattern) => Regex::new(&*pattern),
+        None => Regex::new(".*"),
+    }
+    .unwrap();
+
     macro_rules! tests {
         ($($name:ident),* $(,)?) => {
             [
@@ -43,12 +79,20 @@ pub async fn test_conformance<R: Registry + Send + Sync + 'static>() -> ExitCode
         cross_registry_dependencies,
     ];
 
-    let tests = to_run.into_iter().map(|t| async move {
-        let TestDefinition { name, f } = t;
+    let tests = to_run.into_iter().map(|t| {
+        let should_run = selected_tests.is_match(t.name);
 
-        let result = wrap_test::<R, _>(move |a, b| f(a, b)).await;
+        async move {
+            let TestDefinition { name, f } = t;
 
-        TestResult { name, result }
+            let result = if should_run {
+                wrap_test::<R, _>(move |a, b| f(a, b)).await.into()
+            } else {
+                TestResultKind::Skipped
+            };
+
+            TestResult { name, result }
+        }
     });
 
     let running = stream::iter(tests).buffer_unordered(4);
@@ -57,11 +101,8 @@ pub async fn test_conformance<R: Registry + Send + Sync + 'static>() -> ExitCode
         .inspect(|t| {
             let TestResult { name, result } = t;
 
-            if result.is_ok() {
-                eprintln!("PASS: {name}");
-            } else {
-                eprintln!("FAIL: {name}");
-            }
+            let code = result.code();
+            eprintln!("{code}: {name}");
         })
         .collect::<Vec<_>>()
         .await;
@@ -70,7 +111,7 @@ pub async fn test_conformance<R: Registry + Send + Sync + 'static>() -> ExitCode
 
     for t in complete {
         let TestResult { name, result } = t;
-        if let Err(e) = result {
+        if let TestResultKind::Failure(e) = result {
             eprintln!("=== {name}");
             eprintln!("{}", snafu::Report::from_error(&e));
 
