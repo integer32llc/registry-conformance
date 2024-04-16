@@ -18,6 +18,8 @@ pub async fn test_conformance<R: Registry + Send + Sync + 'static>() -> ExitCode
         wrap_test::<R, _>(|a, b| multiple_sibling_dependencies(a, b).boxed()).await;
     let multiple_hierarchical_dependencies =
         wrap_test::<R, _>(|a, b| multiple_hierarchical_dependencies(a, b).boxed()).await;
+    let cross_registry_dependencies =
+        wrap_test::<R, _>(|a, b| cross_registry_dependencies(a, b).boxed()).await;
 
     let mut exit_code = ExitCode::SUCCESS;
 
@@ -28,6 +30,7 @@ pub async fn test_conformance<R: Registry + Send + Sync + 'static>() -> ExitCode
         name_length_4,
         multiple_sibling_dependencies,
         multiple_hierarchical_dependencies,
+        cross_registry_dependencies,
     ] {
         if let Err(e) = test {
             eprintln!("{}", snafu::Report::from_error(e));
@@ -126,9 +129,11 @@ async fn parameterized_name(
     let registry_url = registry.registry_url().await;
     registry.publish_crate(&library_crate).await?;
 
+    let reg = CreatedRegistry::new("mine", registry_url);
+
     let usage_crate = Crate::new("the-binary", "0.1.0")
-        .add_registry("mine", &registry_url)
-        .add_dependency("mine", &library_crate)
+        .add_registry(&reg)
+        .add_dependency(library_crate.in_registry(&reg))
         .main_rs(format!(
             "fn main() {{ assert_eq!(3, {crate_name}::add(1, 2)); }}",
             crate_name = library_crate.name,
@@ -158,11 +163,12 @@ async fn multiple_sibling_dependencies(
     registry.publish_crate(&right_crate).await?;
 
     let registry_url = registry.registry_url().await;
+    let reg = CreatedRegistry::new("mine", registry_url);
 
     let usage_crate = Crate::new("the-binary", "0.1.0")
-        .add_registry("mine", &registry_url)
-        .add_dependency("mine", &left_crate)
-        .add_dependency("mine", &right_crate)
+        .add_registry(&reg)
+        .add_dependency(left_crate.in_registry(&reg))
+        .add_dependency(right_crate.in_registry(&reg))
         .main_rs("fn main() { assert_eq!(7, left::add(1, right::mul(2, 3))); }")
         .create_in(scratch)
         .await?;
@@ -177,6 +183,7 @@ async fn multiple_hierarchical_dependencies(
     registry: &mut impl Registry,
 ) -> Result<(), BoxError> {
     let registry_url = registry.registry_url().await;
+    let reg = CreatedRegistry::new("mine", registry_url);
 
     let two_away_crate = Crate::new("two", "0.1.0")
         .lib_rs("pub fn add(a: u8, b: u8) -> u8 { a + b }")
@@ -185,17 +192,51 @@ async fn multiple_hierarchical_dependencies(
     registry.publish_crate(&two_away_crate).await?;
 
     let one_away_crate = Crate::new("one", "0.2.0")
-        .add_registry("mine", &registry_url)
-        .add_dependency("mine", &two_away_crate)
+        .add_registry(&reg)
+        .add_dependency(two_away_crate.in_registry(&reg))
         .lib_rs("pub fn triple(a: u8) -> u8 { two::add(a, two::add(a, a)) }")
         .create_in(scratch)
         .await?;
     registry.publish_crate(&one_away_crate).await?;
 
     let usage_crate = Crate::new("the-binary", "0.1.0")
-        .add_registry("mine", &registry_url)
-        .add_dependency("mine", &one_away_crate)
+        .add_registry(&reg)
+        .add_dependency(one_away_crate.in_registry(&reg))
         .main_rs("fn main() { assert_eq!(9, one::triple(3)); }")
+        .create_in(scratch)
+        .await?;
+
+    usage_crate.run().await?;
+
+    Ok(())
+}
+
+async fn cross_registry_dependencies(
+    scratch: &ScratchSpace,
+    registry: &mut impl Registry,
+) -> Result<(), BoxError> {
+    let registry_url = registry.registry_url().await;
+    let reg = CreatedRegistry::new("mine", registry_url);
+
+    let library_crate = Crate::new("the-library", "0.2.0")
+        .add_dependency(("either", "1.0"))
+        .lib_rs(
+            "pub fn iter(c: bool) -> impl Iterator<Item = u8> {
+                 if c {
+                     either::Either::Left([1u8].into_iter())
+                 } else {
+                     either::Either::Right([2u8, 3].into_iter())
+                 }
+             }",
+        )
+        .create_in(scratch)
+        .await?;
+    registry.publish_crate(&library_crate).await?;
+
+    let usage_crate = Crate::new("the-binary", "0.1.0")
+        .add_registry(&reg)
+        .add_dependency(library_crate.in_registry(&reg))
+        .main_rs("fn main() { assert_eq!(2, the_library::iter(false).count()); }")
         .create_in(scratch)
         .await?;
 
@@ -275,6 +316,97 @@ pub trait Registry: Sized {
     fn shutdown(self) -> impl Future<Output = Result<(), Self::Error>>;
 }
 
+trait RegistryDefinition {
+    fn name(&self) -> &str;
+    fn url(&self) -> &str;
+}
+
+impl<R: RegistryDefinition> RegistryDefinition for &R {
+    fn name(&self) -> &str {
+        R::name(self)
+    }
+
+    fn url(&self) -> &str {
+        R::url(self)
+    }
+}
+
+impl RegistryDefinition for CreatedRegistry {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn url(&self) -> &str {
+        &self.url
+    }
+}
+
+trait DependencyDefinition {
+    fn registry(&self) -> Option<&str>;
+    fn name(&self) -> &str;
+    fn version(&self) -> &str;
+}
+
+impl<D: DependencyDefinition> DependencyDefinition for &D {
+    fn registry(&self) -> Option<&str> {
+        D::registry(self)
+    }
+
+    fn name(&self) -> &str {
+        D::name(self)
+    }
+
+    fn version(&self) -> &str {
+        D::version(self)
+    }
+}
+
+#[derive(Debug)]
+struct CreatedRegistry {
+    name: String,
+    url: String,
+}
+
+impl CreatedRegistry {
+    fn new(name: impl Into<String>, url: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            url: url.into(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct In<'a>(&'a CreatedRegistry, &'a CreatedCrate);
+
+impl DependencyDefinition for In<'_> {
+    fn registry(&self) -> Option<&str> {
+        Some(&self.0.name)
+    }
+
+    fn name(&self) -> &str {
+        &self.1.name
+    }
+
+    fn version(&self) -> &str {
+        &self.1.version
+    }
+}
+
+impl DependencyDefinition for (&str, &str) {
+    fn registry(&self) -> Option<&str> {
+        None
+    }
+
+    fn name(&self) -> &str {
+        self.0
+    }
+
+    fn version(&self) -> &str {
+        self.1
+    }
+}
+
 #[derive(Debug)]
 struct Crate {
     cargo_toml: cargo_toml::Root,
@@ -289,6 +421,7 @@ impl Crate {
                 package: cargo_toml::Package {
                     name: name.into(),
                     version: version.into(),
+                    edition: "2021".into(),
                 },
                 dependencies: Default::default(),
             },
@@ -307,20 +440,23 @@ impl Crate {
         self
     }
 
-    fn add_registry(mut self, name: impl Into<String>, url: impl Into<String>) -> Self {
+    fn add_registry(mut self, registry: impl RegistryDefinition) -> Self {
         let dotcargo_config = self.dotcargo_config.get_or_insert_with(Default::default);
-        dotcargo_config
-            .registries
-            .insert(name.into(), dotcargo_config::Registry { index: url.into() });
+        dotcargo_config.registries.insert(
+            registry.name().to_owned(),
+            dotcargo_config::Registry {
+                index: registry.url().to_owned(),
+            },
+        );
         self
     }
 
-    fn add_dependency(mut self, registry: impl Into<String>, crate_: &CreatedCrate) -> Self {
+    fn add_dependency(mut self, dependency: impl DependencyDefinition) -> Self {
         self.cargo_toml.dependencies.insert(
-            crate_.name.clone(),
+            dependency.name().to_owned(),
             cargo_toml::Dependency {
-                version: crate_.version.clone(),
-                registry: registry.into(),
+                version: dependency.version().to_owned(),
+                registry: dependency.registry().map(ToOwned::to_owned),
             },
         );
         self
@@ -377,7 +513,7 @@ impl Crate {
 
         let Self { cargo_toml, .. } = self;
         let cargo_toml::Root { package, .. } = cargo_toml;
-        let cargo_toml::Package { name, version } = package;
+        let cargo_toml::Package { name, version, .. } = package;
 
         Ok(CreatedCrate {
             directory: crate_path,
@@ -493,6 +629,10 @@ impl CreatedCrate {
         package_path.push(format!("{name}-{version}.crate"));
         package_path
     }
+
+    fn in_registry<'a>(&'a self, reg: &'a CreatedRegistry) -> In<'a> {
+        In(reg, self)
+    }
 }
 
 #[derive(Debug, Snafu)]
@@ -541,12 +681,13 @@ mod cargo_toml {
     pub struct Package {
         pub name: String,
         pub version: String,
+        pub edition: String,
     }
 
     #[derive(Debug, Serialize)]
     pub struct Dependency {
         pub version: String,
-        pub registry: String,
+        pub registry: Option<String>,
     }
 }
 
