@@ -1,7 +1,7 @@
 #![deny(rust_2018_idioms)]
 #![deny(unused_crate_dependencies)]
 
-use futures::{future::BoxFuture, FutureExt};
+use futures::{future::BoxFuture, stream, FutureExt, StreamExt};
 use snafu::prelude::*;
 use std::{collections::BTreeMap, future::Future, path::PathBuf, process::ExitCode};
 use tempfile::TempDir;
@@ -9,21 +9,31 @@ use tokio::{fs, process::Command};
 
 type BoxError = Box<dyn snafu::Error + Send + Sync + 'static>;
 
+struct TestDefinition<R: 'static> {
+    name: &'static str,
+    f: Box<dyn for<'a> FnOnce(&'a ScratchSpace, &'a mut R) -> BoxFuture<'a, Result<(), BoxError>>>,
+}
+
+struct TestResult {
+    name: &'static str,
+    result: Result<(), TestError>,
+}
+
 pub async fn test_conformance<R: Registry + Send + Sync + 'static>() -> ExitCode {
-    let name_length_1 = wrap_test::<R, _>(|a, b| name_length_1(a, b).boxed()).await;
-    let name_length_2 = wrap_test::<R, _>(|a, b| name_length_2(a, b).boxed()).await;
-    let name_length_3 = wrap_test::<R, _>(|a, b| name_length_3(a, b).boxed()).await;
-    let name_length_4 = wrap_test::<R, _>(|a, b| name_length_4(a, b).boxed()).await;
-    let multiple_sibling_dependencies =
-        wrap_test::<R, _>(|a, b| multiple_sibling_dependencies(a, b).boxed()).await;
-    let multiple_hierarchical_dependencies =
-        wrap_test::<R, _>(|a, b| multiple_hierarchical_dependencies(a, b).boxed()).await;
-    let cross_registry_dependencies =
-        wrap_test::<R, _>(|a, b| cross_registry_dependencies(a, b).boxed()).await;
+    macro_rules! tests {
+        ($($name:ident),* $(,)?) => {
+            [
+                $(
+                    TestDefinition {
+                        name: stringify!($name),
+                        f: Box::new(|a, b: &mut R| $name(a, b).boxed()),
+                    }
+                ,)*
+            ]
+        };
+    }
 
-    let mut exit_code = ExitCode::SUCCESS;
-
-    for test in [
+    let to_run = tests![
         name_length_1,
         name_length_2,
         name_length_3,
@@ -31,9 +41,43 @@ pub async fn test_conformance<R: Registry + Send + Sync + 'static>() -> ExitCode
         multiple_sibling_dependencies,
         multiple_hierarchical_dependencies,
         cross_registry_dependencies,
-    ] {
-        if let Err(e) = test {
-            eprintln!("{}", snafu::Report::from_error(e));
+    ];
+
+    let tests = to_run.into_iter().map(|t| async move {
+        let TestDefinition { name, f } = t;
+
+        let result = wrap_test::<R, _>(move |a, b| f(a, b)).await;
+
+        TestResult { name, result }
+    });
+
+    let running = stream::iter(tests).buffer_unordered(4);
+
+    let complete = running
+        .inspect(|t| {
+            let TestResult { name, result } = t;
+
+            if result.is_ok() {
+                eprintln!("PASS: {name}");
+            } else {
+                eprintln!("FAIL: {name}");
+            }
+        })
+        .collect::<Vec<_>>()
+        .await;
+
+    let mut exit_code = ExitCode::SUCCESS;
+
+    for t in complete {
+        let TestResult { name, result } = t;
+        if let Err(e) = result {
+            eprintln!("=== {name}");
+            eprintln!("{}", snafu::Report::from_error(&e));
+
+            if let TestError::Failure { scratch_space, .. } = e {
+                eprintln!("Artifacts left in {}", scratch_space.display());
+            }
+
             exit_code = ExitCode::FAILURE;
         }
     }
@@ -54,12 +98,11 @@ where
         .boxed()
         .context(RegistryStartSnafu)?;
 
-    match f(&scratch, &mut registry).await.context(FailureSnafu) {
+    match f(&scratch, &mut registry).await {
         Ok(it) => it,
         Err(err) => {
-            let scratch = scratch.leave_it();
-            eprintln!("Artifacts left in {}", scratch.display());
-            return Err(err);
+            let scratch_space = scratch.leave_it();
+            return Err(err).context(FailureSnafu { scratch_space });
         }
     };
 
@@ -82,7 +125,10 @@ enum TestError {
     RegistryStart { source: BoxError },
 
     #[snafu(display("The test failed"))]
-    Failure { source: BoxError },
+    Failure {
+        source: BoxError,
+        scratch_space: PathBuf,
+    },
 
     #[snafu(display("Could not shut down the registry"))]
     RegistryShutdown { source: BoxError },
