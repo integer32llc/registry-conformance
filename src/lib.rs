@@ -9,10 +9,11 @@ use tempfile::TempDir;
 use tokio::{fs, process::Command};
 
 type BoxError = Box<dyn snafu::Error + Send + Sync + 'static>;
+type BoxResult<T = ()> = Result<T, BoxError>;
 
 struct TestDefinition<R: 'static> {
     name: &'static str,
-    f: Box<dyn for<'a> FnOnce(&'a ScratchSpace, &'a mut R) -> BoxFuture<'a, Result<(), BoxError>>>,
+    f: Box<dyn for<'a> FnOnce(&'a ScratchSpace, &'a mut R) -> BoxFuture<'a, BoxResult>>,
 }
 
 #[derive(Debug)]
@@ -77,6 +78,7 @@ pub async fn test_conformance<R: Registry + Send + Sync + 'static>(
         multiple_sibling_dependencies,
         multiple_hierarchical_dependencies,
         cross_registry_dependencies,
+        multiple_versions,
     ];
 
     let tests = to_run.into_iter().map(|t| {
@@ -129,7 +131,7 @@ pub async fn test_conformance<R: Registry + Send + Sync + 'static>(
 async fn wrap_test<R, F>(f: F) -> Result<(), TestError>
 where
     R: Registry,
-    F: for<'a> FnOnce(&'a ScratchSpace, &'a mut R) -> BoxFuture<'a, Result<(), BoxError>>,
+    F: for<'a> FnOnce(&'a ScratchSpace, &'a mut R) -> BoxFuture<'a, BoxResult>,
 {
     use test_error::*;
 
@@ -175,31 +177,19 @@ enum TestError {
     RegistryShutdown { source: BoxError },
 }
 
-async fn name_length_1(
-    scratch: &ScratchSpace,
-    registry: &mut impl Registry,
-) -> Result<(), BoxError> {
+async fn name_length_1(scratch: &ScratchSpace, registry: &mut impl Registry) -> BoxResult {
     parameterized_name(scratch, registry, "a").await
 }
 
-async fn name_length_2(
-    scratch: &ScratchSpace,
-    registry: &mut impl Registry,
-) -> Result<(), BoxError> {
+async fn name_length_2(scratch: &ScratchSpace, registry: &mut impl Registry) -> BoxResult {
     parameterized_name(scratch, registry, "ab").await
 }
 
-async fn name_length_3(
-    scratch: &ScratchSpace,
-    registry: &mut impl Registry,
-) -> Result<(), BoxError> {
+async fn name_length_3(scratch: &ScratchSpace, registry: &mut impl Registry) -> BoxResult {
     parameterized_name(scratch, registry, "abc").await
 }
 
-async fn name_length_4(
-    scratch: &ScratchSpace,
-    registry: &mut impl Registry,
-) -> Result<(), BoxError> {
+async fn name_length_4(scratch: &ScratchSpace, registry: &mut impl Registry) -> BoxResult {
     parameterized_name(scratch, registry, "abcd").await
 }
 
@@ -207,7 +197,7 @@ async fn parameterized_name(
     scratch: &ScratchSpace,
     registry: &mut impl Registry,
     name: &str,
-) -> Result<(), BoxError> {
+) -> BoxResult {
     let library_crate = Crate::new(name, "0.1.0")
         .lib_rs("pub fn add(a: u8, b: u8) -> u8 { a + b }")
         .create_in(scratch)
@@ -236,7 +226,7 @@ async fn parameterized_name(
 async fn multiple_sibling_dependencies(
     scratch: &ScratchSpace,
     registry: &mut impl Registry,
-) -> Result<(), BoxError> {
+) -> BoxResult {
     let left_crate = Crate::new("left", "0.1.0")
         .lib_rs("pub fn add(a: u8, b: u8) -> u8 { a + b }")
         .create_in(scratch)
@@ -268,7 +258,7 @@ async fn multiple_sibling_dependencies(
 async fn multiple_hierarchical_dependencies(
     scratch: &ScratchSpace,
     registry: &mut impl Registry,
-) -> Result<(), BoxError> {
+) -> BoxResult {
     let registry_url = registry.registry_url().await;
     let reg = CreatedRegistry::new("mine", registry_url);
 
@@ -301,7 +291,7 @@ async fn multiple_hierarchical_dependencies(
 async fn cross_registry_dependencies(
     scratch: &ScratchSpace,
     registry: &mut impl Registry,
-) -> Result<(), BoxError> {
+) -> BoxResult {
     let registry_url = registry.registry_url().await;
     let reg = CreatedRegistry::new("mine", registry_url);
 
@@ -324,6 +314,43 @@ async fn cross_registry_dependencies(
         .add_registry(&reg)
         .add_dependency(library_crate.in_registry(&reg))
         .main_rs("fn main() { assert_eq!(2, the_library::iter(false).count()); }")
+        .create_in(scratch)
+        .await?;
+
+    usage_crate.run().await?;
+
+    Ok(())
+}
+
+async fn multiple_versions(scratch: &ScratchSpace, registry: &mut impl Registry) -> BoxResult {
+    let registry_url = registry.registry_url().await;
+    let reg = CreatedRegistry::new("mine", registry_url);
+
+    let library_v1 = Crate::new("the-library", "1.0.0")
+        .lib_rs("pub const VERSION: u8 = 1;")
+        .create_in(scratch)
+        .await?;
+    registry.publish_crate(&library_v1).await?;
+
+    let library_v2 = Crate::new("the-library", "2.0.0")
+        .lib_rs("pub const VERSION: u8 = 2;")
+        .create_in(scratch)
+        .await?;
+    registry.publish_crate(&library_v2).await?;
+
+    let usage_crate = Crate::new("the-binary", "0.1.0")
+        .add_registry(&reg)
+        .add_dependency(library_v1.in_registry(&reg))
+        .main_rs("fn main() { assert_eq!(1, the_library::VERSION); }")
+        .create_in(scratch)
+        .await?;
+
+    usage_crate.run().await?;
+
+    let usage_crate = Crate::new("the-binary", "0.1.0")
+        .add_registry(&reg)
+        .add_dependency(library_v2.in_registry(&reg))
+        .main_rs("fn main() { assert_eq!(2, the_library::VERSION); }")
         .create_in(scratch)
         .await?;
 
