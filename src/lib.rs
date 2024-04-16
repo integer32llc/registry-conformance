@@ -16,6 +16,8 @@ pub async fn test_conformance<R: Registry + Send + Sync + 'static>() -> ExitCode
     let name_length_4 = wrap_test::<R, _>(|a, b| name_length_4(a, b).boxed()).await;
     let multiple_sibling_dependencies =
         wrap_test::<R, _>(|a, b| multiple_sibling_dependencies(a, b).boxed()).await;
+    let multiple_hierarchical_dependencies =
+        wrap_test::<R, _>(|a, b| multiple_hierarchical_dependencies(a, b).boxed()).await;
 
     let mut exit_code = ExitCode::SUCCESS;
 
@@ -25,6 +27,7 @@ pub async fn test_conformance<R: Registry + Send + Sync + 'static>() -> ExitCode
         name_length_3,
         name_length_4,
         multiple_sibling_dependencies,
+        multiple_hierarchical_dependencies,
     ] {
         if let Err(e) = test {
             eprintln!("{}", snafu::Report::from_error(e));
@@ -48,7 +51,14 @@ where
         .boxed()
         .context(RegistryStartSnafu)?;
 
-    f(&scratch, &mut registry).await.context(FailureSnafu)?;
+    match f(&scratch, &mut registry).await.context(FailureSnafu) {
+        Ok(it) => it,
+        Err(err) => {
+            let scratch = scratch.leave_it();
+            eprintln!("Artifacts left in {}", scratch.display());
+            return Err(err);
+        }
+    };
 
     registry
         .shutdown()
@@ -162,6 +172,38 @@ async fn multiple_sibling_dependencies(
     Ok(())
 }
 
+async fn multiple_hierarchical_dependencies(
+    scratch: &ScratchSpace,
+    registry: &mut impl Registry,
+) -> Result<(), BoxError> {
+    let registry_url = registry.registry_url().await;
+
+    let two_away_crate = Crate::new("two", "0.1.0")
+        .lib_rs("pub fn add(a: u8, b: u8) -> u8 { a + b }")
+        .create_in(scratch)
+        .await?;
+    registry.publish_crate(&two_away_crate).await?;
+
+    let one_away_crate = Crate::new("one", "0.2.0")
+        .add_registry("mine", &registry_url)
+        .add_dependency("mine", &two_away_crate)
+        .lib_rs("pub fn triple(a: u8) -> u8 { two::add(a, two::add(a, a)) }")
+        .create_in(scratch)
+        .await?;
+    registry.publish_crate(&one_away_crate).await?;
+
+    let usage_crate = Crate::new("the-binary", "0.1.0")
+        .add_registry("mine", &registry_url)
+        .add_dependency("mine", &one_away_crate)
+        .main_rs("fn main() { assert_eq!(9, one::triple(3)); }")
+        .create_in(scratch)
+        .await?;
+
+    usage_crate.run().await?;
+
+    Ok(())
+}
+
 struct ScratchSpace {
     #[allow(unused)]
     root: TempDir,
@@ -192,6 +234,10 @@ impl ScratchSpace {
             crates_path,
             registry_path,
         })
+    }
+
+    fn leave_it(self) -> PathBuf {
+        self.root.into_path()
     }
 }
 
