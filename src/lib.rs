@@ -406,6 +406,7 @@ async fn conflicting_links(scratch: &ScratchSpace, registry: &mut impl Registry)
 struct ScratchSpace {
     #[allow(unused)]
     root: TempDir,
+    cargo_home_path: PathBuf,
     crates_path: PathBuf,
     registry_path: PathBuf,
 }
@@ -415,6 +416,13 @@ impl ScratchSpace {
         use scratch_space_error::*;
 
         let root = TempDir::new().context(RootSnafu)?;
+
+        let cargo_home_path = root.path().join("cargo-home");
+        fs::create_dir_all(&cargo_home_path)
+            .await
+            .context(CargoHomeCreateSnafu {
+                path: &cargo_home_path,
+            })?;
 
         let crates_path = root.path().join("crates");
         fs::create_dir_all(&crates_path)
@@ -430,6 +438,7 @@ impl ScratchSpace {
 
         Ok(Self {
             root,
+            cargo_home_path,
             crates_path,
             registry_path,
         })
@@ -445,6 +454,12 @@ impl ScratchSpace {
 enum ScratchSpaceError {
     #[snafu(display("Could not create the scratch space root"))]
     Root { source: std::io::Error },
+
+    #[snafu(display("Could not create the Cargo home directory at {}", path.display()))]
+    CargoHomeCreate {
+        source: std::io::Error,
+        path: PathBuf,
+    },
 
     #[snafu(display("Could not create the crates directory at {}", path.display()))]
     CratesCreate {
@@ -696,6 +711,7 @@ impl Crate {
         let cargo_toml::Package { name, version, .. } = package;
 
         Ok(CreatedCrate {
+            cargo_home: scratch.cargo_home_path.clone(),
             directory: crate_path,
             name,
             version,
@@ -757,6 +773,7 @@ enum CreateCrateError {
 
 #[derive(Debug)]
 pub struct CreatedCrate {
+    cargo_home: PathBuf,
     directory: PathBuf,
     name: String,
     version: String,
@@ -808,6 +825,7 @@ impl CreatedCrate {
 
         cmd.current_dir(&self.directory)
             .env("RUSTUP_TOOLCHAIN", "stable")
+            .env("CARGO_HOME", &self.cargo_home)
             .kill_on_drop(true);
 
         cmd
@@ -818,6 +836,7 @@ impl CreatedCrate {
             directory,
             name,
             version,
+            ..
         } = self;
 
         let mut package_path = directory.join("target");
