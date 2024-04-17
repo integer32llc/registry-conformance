@@ -1,10 +1,16 @@
 #![deny(rust_2018_idioms)]
 #![deny(unused_crate_dependencies)]
 
+use assertables::*;
 use futures::{future::BoxFuture, stream, FutureExt, StreamExt};
 use regex::Regex;
 use snafu::prelude::*;
-use std::{collections::BTreeMap, future::Future, path::PathBuf, process::ExitCode};
+use std::{
+    collections::BTreeMap,
+    future::Future,
+    path::PathBuf,
+    process::{self, ExitCode},
+};
 use tempfile::TempDir;
 use tokio::{fs, process::Command};
 
@@ -79,6 +85,7 @@ pub async fn test_conformance<R: Registry + Send + Sync + 'static>(
         multiple_hierarchical_dependencies,
         cross_registry_dependencies,
         multiple_versions,
+        conflicting_links,
     ];
 
     let tests = to_run.into_iter().map(|t| {
@@ -359,6 +366,43 @@ async fn multiple_versions(scratch: &ScratchSpace, registry: &mut impl Registry)
     Ok(())
 }
 
+async fn conflicting_links(scratch: &ScratchSpace, registry: &mut impl Registry) -> BoxResult {
+    let registry_url = registry.registry_url().await;
+    let reg = CreatedRegistry::new("mine", registry_url);
+    let links_key = "native-library";
+
+    let conflict_one = Crate::new("conflict-one", "1.0.0")
+        .links(links_key)
+        .build_script("fn main() {}")
+        .lib_rs("pub const ID: u8 = 1;")
+        .create_in(scratch)
+        .await?;
+    registry.publish_crate(&conflict_one).await?;
+
+    let conflict_two = Crate::new("conflict-two", "1.0.0")
+        .links(links_key)
+        .build_script("fn main() {}")
+        .lib_rs("pub const ID: u8 = 2;")
+        .create_in(scratch)
+        .await?;
+    registry.publish_crate(&conflict_two).await?;
+
+    let usage_crate = Crate::new("the-binary", "0.1.0")
+        .add_registry(&reg)
+        .add_dependency(conflict_one.in_registry(&reg))
+        .add_dependency(conflict_two.in_registry(&reg))
+        .main_rs("fn main() {}")
+        .create_in(scratch)
+        .await?;
+
+    let output = usage_crate.run_to_failure().await?;
+    // If the registry doesn't put the links in the index, then Cargo
+    // will download the crates and only find the conflict later.
+    assert_not_contains!(output.stderr, "ownload");
+
+    Ok(())
+}
+
 struct ScratchSpace {
     #[allow(unused)]
     root: TempDir,
@@ -526,6 +570,7 @@ struct Crate {
     cargo_toml: cargo_toml::Root,
     src: BTreeMap<PathBuf, String>,
     dotcargo_config: Option<dotcargo_config::Root>,
+    build_script: Option<String>,
 }
 
 impl Crate {
@@ -536,11 +581,13 @@ impl Crate {
                     name: name.into(),
                     version: version.into(),
                     edition: "2021".into(),
+                    links: Default::default(),
                 },
                 dependencies: Default::default(),
             },
-            dotcargo_config: Default::default(),
             src: Default::default(),
+            dotcargo_config: Default::default(),
+            build_script: Default::default(),
         }
     }
 
@@ -573,6 +620,16 @@ impl Crate {
                 registry: dependency.registry().map(ToOwned::to_owned),
             },
         );
+        self
+    }
+
+    fn links(mut self, links_key: impl Into<String>) -> Self {
+        self.cargo_toml.package.links = Some(links_key.into());
+        self
+    }
+
+    fn build_script(mut self, contents: impl Into<String>) -> Self {
+        self.build_script = Some(contents.into());
         self
     }
 
@@ -623,6 +680,15 @@ impl Crate {
                     .await
                     .context(SourceCodeWriteSnafu { path: src_path })?
             }
+        }
+
+        if let Some(build_script) = &self.build_script {
+            let build_script_path = crate_path.join("build.rs");
+            fs::write(&build_script_path, build_script)
+                .await
+                .context(BuildScriptWriteSnafu {
+                    path: build_script_path,
+                })?;
         }
 
         let Self { cargo_toml, .. } = self;
@@ -681,6 +747,12 @@ enum CreateCrateError {
         source: std::io::Error,
         path: PathBuf,
     },
+
+    #[snafu(display("Could not write the build script {}", path.display()))]
+    BuildScriptWrite {
+        source: std::io::Error,
+        path: PathBuf,
+    },
 }
 
 #[derive(Debug)]
@@ -711,12 +783,22 @@ impl CreatedCrate {
         Ok(package_path)
     }
 
-    async fn run(&self) -> Result<(), RunError> {
+    async fn run(&self) -> Result<CommandOutput, RunError> {
         use run_error::*;
 
         self.cargo_command()
             .arg("run")
             .expect_success()
+            .await
+            .context(ExecutionSnafu)
+    }
+
+    async fn run_to_failure(&self) -> Result<CommandOutput, RunError> {
+        use run_error::*;
+
+        self.cargo_command()
+            .arg("run")
+            .expect_failure()
             .await
             .context(ExecutionSnafu)
     }
@@ -796,6 +878,7 @@ mod cargo_toml {
         pub name: String,
         pub version: String,
         pub edition: String,
+        pub links: Option<String>,
     }
 
     #[derive(Debug, Serialize)]
@@ -805,11 +888,29 @@ mod cargo_toml {
     }
 }
 
+#[derive(Debug)]
+pub struct CommandOutput {
+    stdout: String,
+    stderr: String,
+}
+
+impl From<&process::Output> for CommandOutput {
+    fn from(output: &process::Output) -> Self {
+        let stdout = String::from_utf8_lossy(&output.stdout).into();
+        let stderr = String::from_utf8_lossy(&output.stderr).into();
+
+        Self { stdout, stderr }
+    }
+}
+
 #[derive(Debug, Snafu)]
 #[snafu(module)]
 pub enum CommandError {
     #[snafu(transparent)]
     Output { source: std::io::Error },
+
+    #[snafu(display("The command succeeded.\nstdout:\n{stdout}\nstderr:\n{stderr}"))]
+    SuccessExit { stdout: String, stderr: String },
 
     #[snafu(display("The command failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"))]
     ErrorExit { stdout: String, stderr: String },
@@ -817,20 +918,42 @@ pub enum CommandError {
 
 #[allow(async_fn_in_trait)]
 pub trait CommandExt {
-    async fn expect_success(&mut self) -> Result<(), CommandError>;
+    async fn expect_success(&mut self) -> Result<CommandOutput, CommandError>;
+    async fn expect_failure(&mut self) -> Result<CommandOutput, CommandError>;
 }
 
 impl CommandExt for Command {
-    async fn expect_success(&mut self) -> Result<(), CommandError> {
+    async fn expect_success(&mut self) -> Result<CommandOutput, CommandError> {
         use command_error::*;
 
         let out = self.output().await?;
-        ensure!(out.status.success(), {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            ErrorExitSnafu { stdout, stderr }
-        });
+        let output = CommandOutput::from(&out);
 
-        Ok(())
+        ensure!(
+            out.status.success(),
+            ErrorExitSnafu {
+                stdout: output.stdout,
+                stderr: output.stderr,
+            }
+        );
+
+        Ok(output)
+    }
+
+    async fn expect_failure(&mut self) -> Result<CommandOutput, CommandError> {
+        use command_error::*;
+
+        let out = self.output().await?;
+        let output = CommandOutput::from(&out);
+
+        ensure!(
+            !out.status.success(),
+            SuccessExitSnafu {
+                stdout: output.stdout,
+                stderr: output.stderr,
+            }
+        );
+
+        Ok(output)
     }
 }
