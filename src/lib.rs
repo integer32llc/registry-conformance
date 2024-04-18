@@ -14,6 +14,8 @@ use std::{
 use tempfile::TempDir;
 use tokio::{fs, process::Command};
 
+use definition::{Dependency2, DependencyDefinition, RegistryDefinition};
+
 type BoxError = Box<dyn snafu::Error + Send + Sync + 'static>;
 type BoxResult<T = ()> = Result<T, BoxError>;
 
@@ -87,6 +89,7 @@ pub async fn test_conformance<R: Registry + Send + Sync + 'static>(
         multiple_versions,
         conflicting_links,
         minimum_version,
+        optional_dependency,
     ];
 
     let tests = to_run.into_iter().map(|t| {
@@ -185,12 +188,13 @@ enum TestError {
     RegistryShutdown { source: BoxError },
 }
 
-macro_rules! assert_nothing_downloaded {
-    ($scratch:expr) => {
-        let how_many = $scratch.downloaded_crates().await?;
+macro_rules! assert_downloaded_crates {
+    ($scratch:expr, $expected:expr) => {
+        let expected = $expected;
+        let actual = $scratch.downloaded_crates().await?;
         assert!(
-            0 == how_many,
-            "Should not have downloaded crates, but there were {how_many}"
+            expected == actual,
+            "Should have downloaded {expected} crates, but there were {actual}",
         );
     };
 }
@@ -228,7 +232,7 @@ async fn parameterized_name(
 
     let usage_crate = Crate::new("the-binary", "0.1.0")
         .add_registry(&reg)
-        .add_dependency(library_crate.in_registry(&reg))
+        .add_dependency(library_crate.as_ref().in_registry(&reg))
         .main_rs(format!(
             "fn main() {{ assert_eq!(3, {crate_name}::add(1, 2)); }}",
             crate_name = library_crate.name,
@@ -409,7 +413,7 @@ async fn conflicting_links(scratch: &ScratchSpace, registry: &mut impl Registry)
     usage_crate.cargo().run().command().expect_failure().await?;
     // If the registry doesn't put the links in the index, then Cargo
     // will download the crates and only find the conflict later.
-    assert_nothing_downloaded!(scratch);
+    assert_downloaded_crates!(scratch, 0);
 
     Ok(())
 }
@@ -447,6 +451,37 @@ async fn minimum_version(scratch: &ScratchSpace, registry: &mut impl Registry) -
         .command()
         .expect_success()
         .await?;
+
+    Ok(())
+}
+
+async fn optional_dependency(scratch: &ScratchSpace, registry: &mut impl Registry) -> BoxResult {
+    let registry_url = registry.registry_url().await;
+    let reg = CreatedRegistry::new("mine", registry_url);
+
+    let unused_dependency = Crate::new("unused", "1.0.0")
+        .lib_rs("const _: () = panic!();")
+        .create_in(scratch)
+        .await?;
+    registry.publish_crate(&unused_dependency).await?;
+
+    let library_crate = Crate::new("the-library", "1.0.0")
+        .add_registry(&reg)
+        .add_dependency(unused_dependency.in_registry(&reg).optional())
+        .lib_rs("pub const ID: u8 = 1;")
+        .create_in(scratch)
+        .await?;
+    registry.publish_crate(&library_crate).await?;
+
+    let usage_crate = Crate::new("the-binary", "0.1.0")
+        .add_registry(&reg)
+        .add_dependency(library_crate.in_registry(&reg))
+        .main_rs("fn main() { assert_eq!(1, the_library::ID); }")
+        .create_in(scratch)
+        .await?;
+
+    usage_crate.run().await?;
+    assert_downloaded_crates!(scratch, 1);
 
     Ok(())
 }
@@ -607,48 +642,87 @@ pub trait Registry: Sized {
     fn shutdown(self) -> impl Future<Output = Result<(), Self::Error>>;
 }
 
-trait RegistryDefinition {
-    fn name(&self) -> &str;
-    fn url(&self) -> &str;
-}
-
-impl<R: RegistryDefinition> RegistryDefinition for &R {
-    fn name(&self) -> &str {
-        R::name(self)
+mod definition {
+    pub trait RegistryDefinition {
+        fn name(&self) -> &str;
+        fn url(&self) -> &str;
     }
 
-    fn url(&self) -> &str {
-        R::url(self)
-    }
-}
+    impl<R: RegistryDefinition> RegistryDefinition for &R {
+        fn name(&self) -> &str {
+            R::name(self)
+        }
 
-impl RegistryDefinition for CreatedRegistry {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn url(&self) -> &str {
-        &self.url
-    }
-}
-
-trait DependencyDefinition {
-    fn registry(&self) -> Option<&str>;
-    fn name(&self) -> &str;
-    fn version(&self) -> &str;
-}
-
-impl<D: DependencyDefinition> DependencyDefinition for &D {
-    fn registry(&self) -> Option<&str> {
-        D::registry(self)
+        fn url(&self) -> &str {
+            R::url(self)
+        }
     }
 
-    fn name(&self) -> &str {
-        D::name(self)
+    pub trait DependencyDefinition: Sized {
+        fn finish(&self) -> Dependency2<'_>;
+
+        fn as_ref(&self) -> &Self {
+            self
+        }
+
+        fn in_registry<R>(self, reg: R) -> InRegistry<Self, R> {
+            InRegistry(self, reg)
+        }
+
+        fn optional(self) -> Optional<Self> {
+            Optional(self)
+        }
     }
 
-    fn version(&self) -> &str {
-        D::version(self)
+    impl<D: DependencyDefinition> DependencyDefinition for &D {
+        fn finish(&self) -> Dependency2<'_> {
+            D::finish(self)
+        }
+    }
+
+    impl DependencyDefinition for (&str, &str) {
+        fn finish(&self) -> Dependency2<'_> {
+            Dependency2 {
+                name: self.0,
+                version: self.1,
+                registry: None,
+                optional: false,
+            }
+        }
+    }
+
+    pub struct Dependency2<'a> {
+        pub name: &'a str,
+        pub version: &'a str,
+        pub registry: Option<&'a str>,
+        pub optional: bool,
+    }
+
+    pub struct InRegistry<D, R>(D, R);
+
+    impl<D, R> DependencyDefinition for InRegistry<D, R>
+    where
+        D: DependencyDefinition,
+        R: RegistryDefinition,
+    {
+        fn finish(&self) -> Dependency2<'_> {
+            let mut dep = self.0.finish();
+            dep.registry = Some(self.1.name());
+            dep
+        }
+    }
+
+    pub struct Optional<D>(D);
+
+    impl<D> DependencyDefinition for Optional<D>
+    where
+        D: DependencyDefinition,
+    {
+        fn finish(&self) -> Dependency2<'_> {
+            let mut dep = self.0.finish();
+            dep.optional = true;
+            dep
+        }
     }
 }
 
@@ -667,34 +741,13 @@ impl CreatedRegistry {
     }
 }
 
-#[derive(Debug)]
-struct In<'a>(&'a CreatedRegistry, &'a CreatedCrate);
-
-impl DependencyDefinition for In<'_> {
-    fn registry(&self) -> Option<&str> {
-        Some(&self.0.name)
-    }
-
+impl RegistryDefinition for CreatedRegistry {
     fn name(&self) -> &str {
-        &self.1.name
+        &self.name
     }
 
-    fn version(&self) -> &str {
-        &self.1.version
-    }
-}
-
-impl DependencyDefinition for (&str, &str) {
-    fn registry(&self) -> Option<&str> {
-        None
-    }
-
-    fn name(&self) -> &str {
-        self.0
-    }
-
-    fn version(&self) -> &str {
-        self.1
+    fn url(&self) -> &str {
+        &self.url
     }
 }
 
@@ -747,11 +800,19 @@ impl Crate {
     }
 
     fn add_dependency(mut self, dependency: impl DependencyDefinition) -> Self {
+        let Dependency2 {
+            name,
+            version,
+            registry,
+            optional,
+        } = dependency.finish();
+
         self.cargo_toml.dependencies.insert(
-            dependency.name().to_owned(),
+            name.to_owned(),
             cargo_toml::Dependency {
-                version: dependency.version().to_owned(),
-                registry: dependency.registry().map(ToOwned::to_owned),
+                version: version.to_owned(),
+                registry: registry.map(ToOwned::to_owned),
+                optional,
             },
         );
         self
@@ -954,9 +1015,16 @@ impl CreatedCrate {
         package_path.push(format!("{name}-{version}.crate"));
         package_path
     }
+}
 
-    fn in_registry<'a>(&'a self, reg: &'a CreatedRegistry) -> In<'a> {
-        In(reg, self)
+impl DependencyDefinition for CreatedCrate {
+    fn finish(&self) -> Dependency2<'_> {
+        Dependency2 {
+            name: &self.name,
+            version: &self.version,
+            registry: None,
+            optional: false,
+        }
     }
 }
 
@@ -1070,6 +1138,7 @@ mod cargo_toml {
     pub struct Dependency {
         pub version: String,
         pub registry: Option<String>,
+        pub optional: bool,
     }
 }
 
