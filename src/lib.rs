@@ -1,13 +1,13 @@
 #![deny(rust_2018_idioms)]
 #![deny(unused_crate_dependencies)]
 
-use assertables::*;
 use futures::{future::BoxFuture, stream, FutureExt, StreamExt};
 use regex::Regex;
 use snafu::prelude::*;
 use std::{
     collections::BTreeMap,
     future::Future,
+    io,
     path::PathBuf,
     process::{self, ExitCode},
 };
@@ -86,6 +86,7 @@ pub async fn test_conformance<R: Registry + Send + Sync + 'static>(
         cross_registry_dependencies,
         multiple_versions,
         conflicting_links,
+        minimum_version,
     ];
 
     let tests = to_run.into_iter().map(|t| {
@@ -182,6 +183,16 @@ enum TestError {
 
     #[snafu(display("Could not shut down the registry"))]
     RegistryShutdown { source: BoxError },
+}
+
+macro_rules! assert_nothing_downloaded {
+    ($scratch:expr) => {
+        let how_many = $scratch.downloaded_crates().await?;
+        assert!(
+            0 == how_many,
+            "Should not have downloaded crates, but there were {how_many}"
+        );
+    };
 }
 
 async fn name_length_1(scratch: &ScratchSpace, registry: &mut impl Registry) -> BoxResult {
@@ -395,10 +406,47 @@ async fn conflicting_links(scratch: &ScratchSpace, registry: &mut impl Registry)
         .create_in(scratch)
         .await?;
 
-    let output = usage_crate.run_to_failure().await?;
+    usage_crate.cargo().run().command().expect_failure().await?;
     // If the registry doesn't put the links in the index, then Cargo
     // will download the crates and only find the conflict later.
-    assert_not_contains!(output.stderr, "ownload");
+    assert_nothing_downloaded!(scratch);
+
+    Ok(())
+}
+
+async fn minimum_version(scratch: &ScratchSpace, registry: &mut impl Registry) -> BoxResult {
+    let registry_url = registry.registry_url().await;
+    let reg = CreatedRegistry::new("mine", registry_url);
+
+    let current_crate = Crate::new("from-the-future", "1.0.0")
+        .rust_version("1.56")
+        .lib_rs("pub const ID: u16 = 56;")
+        .create_in(scratch)
+        .await?;
+    registry.publish_crate(&current_crate).await?;
+
+    let future_crate = Crate::new("from-the-future", "1.1.0")
+        .rust_version("1.1111")
+        .lib_rs("pub const ID: u16 = 1111;")
+        .create_in(scratch)
+        .await?;
+    registry.publish_crate(&future_crate).await?;
+
+    let usage_crate = Crate::new("the-binary", "0.1.0")
+        .add_registry(&reg)
+        .add_dependency(current_crate.in_registry(&reg))
+        .main_rs("fn main() { assert_eq!(56, from_the_future::ID); }")
+        .create_in(scratch)
+        .await?;
+
+    usage_crate
+        .cargo()
+        .use_nightly()
+        .enable_msrv_resolver()
+        .run()
+        .command()
+        .expect_success()
+        .await?;
 
     Ok(())
 }
@@ -444,6 +492,48 @@ impl ScratchSpace {
         })
     }
 
+    async fn downloaded_crates(&self) -> Result<usize, DownloadedCratesError> {
+        use downloaded_crates_error::*;
+
+        let mut cache_path = self.cargo_home_path.join("registry");
+        cache_path.push("cache");
+
+        let mut d = match fs::read_dir(&cache_path).await {
+            Ok(d) => d,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e).context(OpenCacheSnafu { path: cache_path }),
+        };
+
+        let mut reg = None;
+        while let Some(entry) = d
+            .next_entry()
+            .await
+            .context(EnumerateCacheSnafu { path: &cache_path })?
+        {
+            assert!(reg.is_none(), "Too many registries here");
+            reg = Some(entry.file_name());
+        }
+        let Some(reg) = reg else { return Ok(0) };
+        cache_path.push(reg);
+
+        let mut d = match fs::read_dir(&cache_path).await {
+            Ok(d) => d,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e).context(OpenRegistrySnafu { path: cache_path }),
+        };
+
+        let mut cnt = 0;
+        while let Some(_) = d
+            .next_entry()
+            .await
+            .context(EnumerateRegistrySnafu { path: &cache_path })?
+        {
+            cnt += 1;
+        }
+
+        Ok(cnt)
+    }
+
     fn leave_it(self) -> PathBuf {
         self.root.into_path()
     }
@@ -469,6 +559,34 @@ enum ScratchSpaceError {
 
     #[snafu(display("Could not create the registry directory at {}", path.display()))]
     RegistryCreate {
+        source: std::io::Error,
+        path: PathBuf,
+    },
+}
+
+#[derive(Debug, Snafu)]
+#[snafu(module)]
+enum DownloadedCratesError {
+    #[snafu(display("Could not open the cache directory {}", path.display()))]
+    OpenCache {
+        source: std::io::Error,
+        path: PathBuf,
+    },
+
+    #[snafu(display("Could not enumerate the cache directory {}", path.display()))]
+    EnumerateCache {
+        source: std::io::Error,
+        path: PathBuf,
+    },
+
+    #[snafu(display("Could not open the registry directory {}", path.display()))]
+    OpenRegistry {
+        source: std::io::Error,
+        path: PathBuf,
+    },
+
+    #[snafu(display("Could not enumerate the registry directory {}", path.display()))]
+    EnumerateRegistry {
         source: std::io::Error,
         path: PathBuf,
     },
@@ -597,6 +715,7 @@ impl Crate {
                     version: version.into(),
                     edition: "2021".into(),
                     links: Default::default(),
+                    rust_version: Default::default(),
                 },
                 dependencies: Default::default(),
             },
@@ -648,10 +767,16 @@ impl Crate {
         self
     }
 
+    fn rust_version(mut self, arg: impl Into<String>) -> Self {
+        self.cargo_toml.package.rust_version = Some(arg.into());
+        self
+    }
+
     async fn create_in(self, scratch: &ScratchSpace) -> Result<CreatedCrate, CreateCrateError> {
         use create_crate_error::*;
 
-        let crate_path = scratch.crates_path.join(&self.cargo_toml.package.name);
+        let mut crate_path = scratch.crates_path.join(&self.cargo_toml.package.name);
+        crate_path.push(&self.cargo_toml.package.version);
         fs::create_dir_all(&crate_path)
             .await
             .context(CrateCreateSnafu { path: &crate_path })?;
@@ -783,8 +908,10 @@ impl CreatedCrate {
     pub async fn package(&self) -> Result<PathBuf, PackageError> {
         use package_error::*;
 
-        self.cargo_command()
-            .arg("package")
+        self.cargo()
+            .package()
+            .append_arg("--no-verify")
+            .command()
             .expect_success()
             .await
             .context(ExecutionSnafu)?;
@@ -800,35 +927,18 @@ impl CreatedCrate {
         Ok(package_path)
     }
 
-    async fn run(&self) -> Result<CommandOutput, RunError> {
-        use run_error::*;
-
-        self.cargo_command()
-            .arg("run")
-            .expect_success()
-            .await
-            .context(ExecutionSnafu)
+    async fn run(&self) -> Result<CommandOutput, CommandError> {
+        self.cargo().run().command().expect_success().await
     }
 
-    async fn run_to_failure(&self) -> Result<CommandOutput, RunError> {
-        use run_error::*;
-
-        self.cargo_command()
-            .arg("run")
-            .expect_failure()
-            .await
-            .context(ExecutionSnafu)
-    }
-
-    fn cargo_command(&self) -> Command {
-        let mut cmd = Command::new("cargo");
-
-        cmd.current_dir(&self.directory)
-            .env("RUSTUP_TOOLCHAIN", "stable")
-            .env("CARGO_HOME", &self.cargo_home)
-            .kill_on_drop(true);
-
-        cmd
+    fn cargo(&self) -> CargoCommandBuilder<'_> {
+        CargoCommandBuilder {
+            crate_: self,
+            toolchain: Default::default(),
+            msrv_resolver: Default::default(),
+            command: Default::default(),
+            args: Default::default(),
+        }
     }
 
     fn package_path(&self) -> PathBuf {
@@ -850,6 +960,67 @@ impl CreatedCrate {
     }
 }
 
+struct CargoCommandBuilder<'a> {
+    crate_: &'a CreatedCrate,
+    toolchain: Option<String>,
+    msrv_resolver: bool,
+    command: Option<String>,
+    args: Option<Vec<String>>,
+}
+
+impl CargoCommandBuilder<'_> {
+    fn use_nightly(mut self) -> Self {
+        self.toolchain = Some("nightly".into());
+        self
+    }
+
+    fn enable_msrv_resolver(mut self) -> Self {
+        self.msrv_resolver = true;
+        self
+    }
+
+    fn package(mut self) -> Self {
+        self.command = Some("package".into());
+        self
+    }
+
+    fn run(mut self) -> Self {
+        self.command = Some("run".into());
+        self
+    }
+
+    fn append_arg(mut self, arg: impl Into<String>) -> Self {
+        let args = self.args.get_or_insert_with(Default::default);
+        args.push(arg.into());
+        self
+    }
+
+    fn command(self) -> Command {
+        let mut cmd = Command::new("cargo");
+
+        let toolchain = self.toolchain.as_deref().unwrap_or("stable");
+
+        cmd.current_dir(&self.crate_.directory)
+            .env("CARGO_HOME", &self.crate_.cargo_home)
+            .env("RUSTUP_TOOLCHAIN", toolchain)
+            .kill_on_drop(true);
+
+        if let Some(command) = self.command {
+            cmd.arg(command);
+        }
+
+        if let Some(args) = self.args {
+            cmd.args(args);
+        }
+
+        if self.msrv_resolver {
+            cmd.arg("-Zmsrv-policy");
+        }
+
+        cmd
+    }
+}
+
 #[derive(Debug, Snafu)]
 #[snafu(module)]
 pub enum PackageError {
@@ -858,13 +1029,6 @@ pub enum PackageError {
 
     #[snafu(display("The package file `{}` was not created", path.display()))]
     Missing { path: PathBuf },
-}
-
-#[derive(Debug, Snafu)]
-#[snafu(module)]
-enum RunError {
-    #[snafu(display("Could not run `cargo run`"))]
-    Execution { source: CommandError },
 }
 
 mod dotcargo_config {
@@ -893,11 +1057,13 @@ mod cargo_toml {
     }
 
     #[derive(Debug, Serialize)]
+    #[serde(rename_all = "kebab-case")]
     pub struct Package {
         pub name: String,
         pub version: String,
         pub edition: String,
         pub links: Option<String>,
+        pub rust_version: Option<String>,
     }
 
     #[derive(Debug, Serialize)]
