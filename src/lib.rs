@@ -89,7 +89,8 @@ pub async fn test_conformance<R: Registry + Send + Sync + 'static>(
         multiple_versions,
         conflicting_links,
         minimum_version,
-        optional_dependency,
+        optional_dependency_unused,
+        optional_dependency_used,
     ];
 
     let tests = to_run.into_iter().map(|t| {
@@ -455,7 +456,10 @@ async fn minimum_version(scratch: &ScratchSpace, registry: &mut impl Registry) -
     Ok(())
 }
 
-async fn optional_dependency(scratch: &ScratchSpace, registry: &mut impl Registry) -> BoxResult {
+async fn optional_dependency_unused(
+    scratch: &ScratchSpace,
+    registry: &mut impl Registry,
+) -> BoxResult {
     let registry_url = registry.registry_url().await;
     let reg = CreatedRegistry::new("mine", registry_url);
 
@@ -482,6 +486,44 @@ async fn optional_dependency(scratch: &ScratchSpace, registry: &mut impl Registr
 
     usage_crate.run().await?;
     assert_downloaded_crates!(scratch, 1);
+
+    Ok(())
+}
+
+async fn optional_dependency_used(
+    scratch: &ScratchSpace,
+    registry: &mut impl Registry,
+) -> BoxResult {
+    let registry_url = registry.registry_url().await;
+    let reg = CreatedRegistry::new("mine", registry_url);
+
+    let used_dependency = Crate::new("used", "1.0.0")
+        .lib_rs("pub const ID: u8 = 1;")
+        .create_in(scratch)
+        .await?;
+    registry.publish_crate(&used_dependency).await?;
+
+    let library_crate = Crate::new("the-library", "1.0.0")
+        .add_registry(&reg)
+        .add_dependency(used_dependency.as_ref().in_registry(&reg).optional())
+        .lib_rs("pub use used::ID;")
+        .create_in(scratch)
+        .await?;
+    registry.publish_crate(&library_crate).await?;
+
+    let usage_crate = Crate::new("the-binary", "0.1.0")
+        .add_registry(&reg)
+        .add_dependency(
+            library_crate
+                .in_registry(&reg)
+                .with_feature(&used_dependency.name),
+        )
+        .main_rs("fn main() { assert_eq!(1, the_library::ID); }")
+        .create_in(scratch)
+        .await?;
+
+    usage_crate.run().await?;
+    assert_downloaded_crates!(scratch, 2);
 
     Ok(())
 }
@@ -672,6 +714,10 @@ mod definition {
         fn optional(self) -> Optional<Self> {
             Optional(self)
         }
+
+        fn with_feature(self, name: impl Into<String>) -> WithFeature<Self> {
+            WithFeature(self, name.into())
+        }
     }
 
     impl<D: DependencyDefinition> DependencyDefinition for &D {
@@ -682,12 +728,7 @@ mod definition {
 
     impl DependencyDefinition for (&str, &str) {
         fn finish(&self) -> Dependency2<'_> {
-            Dependency2 {
-                name: self.0,
-                version: self.1,
-                registry: None,
-                optional: false,
-            }
+            Dependency2::base(self.0, self.1)
         }
     }
 
@@ -696,6 +737,19 @@ mod definition {
         pub version: &'a str,
         pub registry: Option<&'a str>,
         pub optional: bool,
+        pub features: Option<Vec<&'a str>>,
+    }
+
+    impl<'a> Dependency2<'a> {
+        pub fn base(name: &'a str, version: &'a str) -> Self {
+            Self {
+                name,
+                version,
+                registry: None,
+                optional: false,
+                features: None,
+            }
+        }
     }
 
     pub struct InRegistry<D, R>(D, R);
@@ -721,6 +775,21 @@ mod definition {
         fn finish(&self) -> Dependency2<'_> {
             let mut dep = self.0.finish();
             dep.optional = true;
+            dep
+        }
+    }
+
+    pub struct WithFeature<D>(D, String);
+
+    impl<D> DependencyDefinition for WithFeature<D>
+    where
+        D: DependencyDefinition,
+    {
+        fn finish(&self) -> Dependency2<'_> {
+            let mut dep = self.0.finish();
+            dep.features
+                .get_or_insert_with(Default::default)
+                .push(&self.1);
             dep
         }
     }
@@ -805,6 +874,7 @@ impl Crate {
             version,
             registry,
             optional,
+            features,
         } = dependency.finish();
 
         self.cargo_toml.dependencies.insert(
@@ -813,6 +883,7 @@ impl Crate {
                 version: version.to_owned(),
                 registry: registry.map(ToOwned::to_owned),
                 optional,
+                features: features.map(|f| f.into_iter().map(ToOwned::to_owned).collect()),
             },
         );
         self
@@ -1019,12 +1090,7 @@ impl CreatedCrate {
 
 impl DependencyDefinition for CreatedCrate {
     fn finish(&self) -> Dependency2<'_> {
-        Dependency2 {
-            name: &self.name,
-            version: &self.version,
-            registry: None,
-            optional: false,
-        }
+        Dependency2::base(&self.name, &self.version)
     }
 }
 
@@ -1139,6 +1205,7 @@ mod cargo_toml {
         pub version: String,
         pub registry: Option<String>,
         pub optional: bool,
+        pub features: Option<Vec<String>>,
     }
 }
 
