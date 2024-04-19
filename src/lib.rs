@@ -90,7 +90,8 @@ pub async fn test_conformance<R: Registry + Send + Sync + 'static>(
         conflicting_links,
         minimum_version,
         optional_dependency_unused,
-        optional_dependency_used,
+        optional_dependency_used_implicit,
+        optional_dependency_used_explicit,
     ];
 
     let tests = to_run.into_iter().map(|t| {
@@ -490,7 +491,7 @@ async fn optional_dependency_unused(
     Ok(())
 }
 
-async fn optional_dependency_used(
+async fn optional_dependency_used_implicit(
     scratch: &ScratchSpace,
     registry: &mut impl Registry,
 ) -> BoxResult {
@@ -518,6 +519,43 @@ async fn optional_dependency_used(
                 .in_registry(&reg)
                 .with_feature(&used_dependency.name),
         )
+        .main_rs("fn main() { assert_eq!(1, the_library::ID); }")
+        .create_in(scratch)
+        .await?;
+
+    usage_crate.run().await?;
+    assert_downloaded_crates!(scratch, 2);
+
+    Ok(())
+}
+
+async fn optional_dependency_used_explicit(
+    scratch: &ScratchSpace,
+    registry: &mut impl Registry,
+) -> BoxResult {
+    let registry_url = registry.registry_url().await;
+    let reg = CreatedRegistry::new("mine", registry_url);
+
+    let used_dependency = Crate::new("used", "1.0.0")
+        .lib_rs("pub const ID: u8 = 1;")
+        .create_in(scratch)
+        .await?;
+    registry.publish_crate(&used_dependency).await?;
+
+    let feature_name = "my-feature";
+
+    let library_crate = Crate::new("the-library", "1.0.0")
+        .add_registry(&reg)
+        .add_dependency(used_dependency.as_ref().in_registry(&reg).optional())
+        .add_feature(feature_name, ["dep:used"])
+        .lib_rs("pub use used::ID;")
+        .create_in(scratch)
+        .await?;
+    registry.publish_crate(&library_crate).await?;
+
+    let usage_crate = Crate::new("the-binary", "0.1.0")
+        .add_registry(&reg)
+        .add_dependency(library_crate.in_registry(&reg).with_feature(feature_name))
         .main_rs("fn main() { assert_eq!(1, the_library::ID); }")
         .create_in(scratch)
         .await?;
@@ -840,6 +878,7 @@ impl Crate {
                     rust_version: Default::default(),
                 },
                 dependencies: Default::default(),
+                features: Default::default(),
             },
             src: Default::default(),
             dotcargo_config: Default::default(),
@@ -886,6 +925,17 @@ impl Crate {
                 features: features.map(|f| f.into_iter().map(ToOwned::to_owned).collect()),
             },
         );
+        self
+    }
+
+    fn add_feature(
+        mut self,
+        name: impl Into<String>,
+        members: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        let name = name.into();
+        let members = members.into_iter().map(Into::into).collect();
+        self.cargo_toml.features.insert(name, members);
         self
     }
 
@@ -1188,6 +1238,7 @@ mod cargo_toml {
     pub struct Root {
         pub package: Package,
         pub dependencies: BTreeMap<String, Dependency>,
+        pub features: BTreeMap<String, Vec<String>>,
     }
 
     #[derive(Debug, Serialize)]
