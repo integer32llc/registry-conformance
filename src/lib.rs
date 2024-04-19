@@ -92,6 +92,8 @@ pub async fn test_conformance<R: Registry + Send + Sync + 'static>(
         optional_dependency_unused,
         optional_dependency_used_implicit,
         optional_dependency_used_explicit,
+        platform_specific_dependency_unused,
+        platform_specific_dependency_used,
     ];
 
     let tests = to_run.into_iter().map(|t| {
@@ -200,6 +202,9 @@ macro_rules! assert_downloaded_crates {
         );
     };
 }
+
+const COMPILATION_FAILURE: &str = "const _: () = panic!();";
+const CURRENT_TARGET: &str = env!("CURRENT_TARGET");
 
 async fn name_length_1(scratch: &ScratchSpace, registry: &mut impl Registry) -> BoxResult {
     parameterized_name(scratch, registry, "a").await
@@ -465,7 +470,7 @@ async fn optional_dependency_unused(
     let reg = CreatedRegistry::new("mine", registry_url);
 
     let unused_dependency = Crate::new("unused", "1.0.0")
-        .lib_rs("const _: () = panic!();")
+        .lib_rs(COMPILATION_FAILURE)
         .create_in(scratch)
         .await?;
     registry.publish_crate(&unused_dependency).await?;
@@ -556,6 +561,74 @@ async fn optional_dependency_used_explicit(
     let usage_crate = Crate::new("the-binary", "0.1.0")
         .add_registry(&reg)
         .add_dependency(library_crate.in_registry(&reg).with_feature(feature_name))
+        .main_rs("fn main() { assert_eq!(1, the_library::ID); }")
+        .create_in(scratch)
+        .await?;
+
+    usage_crate.run().await?;
+    assert_downloaded_crates!(scratch, 2);
+
+    Ok(())
+}
+
+async fn platform_specific_dependency_unused(
+    scratch: &ScratchSpace,
+    registry: &mut impl Registry,
+) -> BoxResult {
+    let registry_url = registry.registry_url().await;
+    let reg = CreatedRegistry::new("mine", registry_url);
+
+    let not_this_platform = Crate::new("not-this-platform", "1.0.0")
+        .lib_rs(COMPILATION_FAILURE)
+        .create_in(scratch)
+        .await?;
+    registry.publish_crate(&not_this_platform).await?;
+
+    let library_crate = Crate::new("the-library", "1.0.0")
+        .add_registry(&reg)
+        .add_target_dependency("not-a-real-target", not_this_platform.in_registry(&reg))
+        .lib_rs("pub const ID: u8 = 1;")
+        .create_in(scratch)
+        .await?;
+    registry.publish_crate(&library_crate).await?;
+
+    let usage_crate = Crate::new("the-binary", "0.1.0")
+        .add_registry(&reg)
+        .add_dependency(library_crate.in_registry(&reg))
+        .main_rs("fn main() { assert_eq!(1, the_library::ID); }")
+        .create_in(scratch)
+        .await?;
+
+    usage_crate.run().await?;
+    assert_downloaded_crates!(scratch, 1);
+
+    Ok(())
+}
+
+async fn platform_specific_dependency_used(
+    scratch: &ScratchSpace,
+    registry: &mut impl Registry,
+) -> BoxResult {
+    let registry_url = registry.registry_url().await;
+    let reg = CreatedRegistry::new("mine", registry_url);
+
+    let this_platform = Crate::new("this-platform", "1.0.0")
+        .lib_rs("pub const ID: u8 = 1;")
+        .create_in(scratch)
+        .await?;
+    registry.publish_crate(&this_platform).await?;
+
+    let library_crate = Crate::new("the-library", "1.0.0")
+        .add_registry(&reg)
+        .add_target_dependency(CURRENT_TARGET, this_platform.in_registry(&reg))
+        .lib_rs("pub use this_platform::ID;")
+        .create_in(scratch)
+        .await?;
+    registry.publish_crate(&library_crate).await?;
+
+    let usage_crate = Crate::new("the-binary", "0.1.0")
+        .add_registry(&reg)
+        .add_dependency(library_crate.in_registry(&reg))
         .main_rs("fn main() { assert_eq!(1, the_library::ID); }")
         .create_in(scratch)
         .await?;
@@ -879,6 +952,7 @@ impl Crate {
                 },
                 dependencies: Default::default(),
                 features: Default::default(),
+                target: Default::default(),
             },
             src: Default::default(),
             dotcargo_config: Default::default(),
@@ -908,6 +982,24 @@ impl Crate {
     }
 
     fn add_dependency(mut self, dependency: impl DependencyDefinition) -> Self {
+        Self::add_dependency_common(&mut self.cargo_toml.dependencies, dependency);
+        self
+    }
+
+    fn add_target_dependency(
+        mut self,
+        target: impl Into<String>,
+        dependency: impl DependencyDefinition,
+    ) -> Self {
+        let target = self.cargo_toml.target.entry(target.into()).or_default();
+        Self::add_dependency_common(&mut target.dependencies, dependency);
+        self
+    }
+
+    fn add_dependency_common(
+        deps: &mut cargo_toml::Dependencies,
+        dependency: impl DependencyDefinition,
+    ) {
         let Dependency2 {
             name,
             version,
@@ -916,7 +1008,7 @@ impl Crate {
             features,
         } = dependency.finish();
 
-        self.cargo_toml.dependencies.insert(
+        deps.insert(
             name.to_owned(),
             cargo_toml::Dependency {
                 version: version.to_owned(),
@@ -925,7 +1017,6 @@ impl Crate {
                 features: features.map(|f| f.into_iter().map(ToOwned::to_owned).collect()),
             },
         );
-        self
     }
 
     fn add_feature(
@@ -1234,11 +1325,14 @@ mod cargo_toml {
     use serde::Serialize;
     use std::collections::BTreeMap;
 
+    pub type Dependencies = BTreeMap<String, Dependency>;
+
     #[derive(Debug, Serialize)]
     pub struct Root {
         pub package: Package,
-        pub dependencies: BTreeMap<String, Dependency>,
+        pub dependencies: Dependencies,
         pub features: BTreeMap<String, Vec<String>>,
+        pub target: BTreeMap<String, Target>,
     }
 
     #[derive(Debug, Serialize)]
@@ -1257,6 +1351,11 @@ mod cargo_toml {
         pub registry: Option<String>,
         pub optional: bool,
         pub features: Option<Vec<String>>,
+    }
+
+    #[derive(Debug, Default, Serialize)]
+    pub struct Target {
+        pub dependencies: Dependencies,
     }
 }
 
