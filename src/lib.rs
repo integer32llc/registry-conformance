@@ -92,6 +92,7 @@ pub async fn test_conformance<R: Registry + Send + Sync + 'static>(
         minimum_version,
         optional_dependency_unused,
         optional_dependency_used_implicit,
+        optional_dependency_used_implicit_renamed,
         optional_dependency_used_explicit,
         platform_specific_dependency_unused,
         platform_specific_dependency_used,
@@ -572,6 +573,48 @@ async fn optional_dependency_used_implicit(
     Ok(())
 }
 
+async fn optional_dependency_used_implicit_renamed(
+    scratch: &ScratchSpace,
+    registry: &mut impl Registry,
+) -> BoxResult {
+    let registry_url = registry.registry_url().await;
+    let reg = CreatedRegistry::new("mine", registry_url);
+
+    let rename = "another";
+
+    let used_dependency = Crate::new("used", "1.0.0")
+        .lib_rs("pub const ID: u8 = 1;")
+        .create_in(scratch)
+        .await?;
+    registry.publish_crate(&used_dependency).await?;
+
+    let library_crate = Crate::new("the-library", "1.0.0")
+        .add_registry(&reg)
+        .add_dependency(
+            used_dependency
+                .as_ref()
+                .in_registry(&reg)
+                .renamed_as(rename)
+                .optional(),
+        )
+        .lib_rs("pub use another::ID;")
+        .create_in(scratch)
+        .await?;
+    registry.publish_crate(&library_crate).await?;
+
+    let usage_crate = Crate::new("the-binary", "0.1.0")
+        .add_registry(&reg)
+        .add_dependency(library_crate.in_registry(&reg).with_feature(rename))
+        .main_rs("fn main() { assert_eq!(1, the_library::ID); }")
+        .create_in(scratch)
+        .await?;
+
+    usage_crate.run().await?;
+    assert_downloaded_crates!(scratch, 2);
+
+    Ok(())
+}
+
 async fn optional_dependency_used_explicit(
     scratch: &ScratchSpace,
     registry: &mut impl Registry,
@@ -892,6 +935,10 @@ mod definition {
             InRegistry(self, reg)
         }
 
+        fn renamed_as(self, name: impl Into<String>) -> RenamedAs<Self> {
+            RenamedAs(self, name.into())
+        }
+
         fn optional(self) -> Optional<Self> {
             Optional(self)
         }
@@ -919,6 +966,7 @@ mod definition {
         pub registry: Option<&'a str>,
         pub optional: bool,
         pub features: Option<Vec<&'a str>>,
+        pub package: Option<&'a str>,
     }
 
     impl<'a> Dependency2<'a> {
@@ -929,6 +977,7 @@ mod definition {
                 registry: None,
                 optional: false,
                 features: None,
+                package: None,
             }
         }
     }
@@ -943,6 +992,21 @@ mod definition {
         fn finish(&self) -> Dependency2<'_> {
             let mut dep = self.0.finish();
             dep.registry = Some(self.1.name());
+            dep
+        }
+    }
+
+    pub struct RenamedAs<D>(D, String);
+
+    impl<D> DependencyDefinition for RenamedAs<D>
+    where
+        D: DependencyDefinition,
+    {
+        fn finish(&self) -> Dependency2<'_> {
+            let mut dep = self.0.finish();
+            let package = dep.name;
+            dep.name = &self.1;
+            dep.package.get_or_insert(package);
             dep
         }
     }
@@ -1082,6 +1146,7 @@ impl Crate {
             registry,
             optional,
             features,
+            package,
         } = dependency.finish();
 
         deps.insert(
@@ -1091,6 +1156,7 @@ impl Crate {
                 registry: registry.map(ToOwned::to_owned),
                 optional,
                 features: features.map(|f| f.into_iter().map(ToOwned::to_owned).collect()),
+                package: package.map(ToOwned::to_owned),
             },
         );
     }
@@ -1429,6 +1495,7 @@ mod cargo_toml {
         pub registry: Option<String>,
         pub optional: bool,
         pub features: Option<Vec<String>>,
+        pub package: Option<String>,
     }
 
     #[derive(Debug, Default, Serialize)]
