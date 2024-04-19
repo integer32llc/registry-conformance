@@ -8,7 +8,8 @@ use std::{
     collections::BTreeMap,
     future::Future,
     io,
-    path::PathBuf,
+    panic::AssertUnwindSafe,
+    path::{Path, PathBuf},
     process::{self, ExitCode},
 };
 use tempfile::TempDir;
@@ -94,6 +95,7 @@ pub async fn test_conformance<R: Registry + Send + Sync + 'static>(
         optional_dependency_used_explicit,
         platform_specific_dependency_unused,
         platform_specific_dependency_used,
+        build_only_dependency,
     ];
 
     let tests = to_run.into_iter().map(|t| {
@@ -132,7 +134,7 @@ pub async fn test_conformance<R: Registry + Send + Sync + 'static>(
             eprintln!("=== {name}");
             eprintln!("{}", snafu::Report::from_error(&e));
 
-            if let TestError::Failure { scratch_space, .. } = e {
+            if let Some(scratch_space) = e.scratch_space() {
                 eprintln!("Artifacts left in {}", scratch_space.display());
             }
 
@@ -156,9 +158,28 @@ where
         .boxed()
         .context(RegistryStartSnafu)?;
 
-    match f(&scratch, &mut registry).await {
-        Ok(it) => it,
+    let running = f(&scratch, &mut registry);
+    let running = AssertUnwindSafe(running).catch_unwind();
+
+    match running.await {
+        Ok(Ok(it)) => it,
+
         Err(err) => {
+            let scratch_space = scratch.leave_it();
+
+            let text = match err.downcast::<String>() {
+                Ok(text) => *text,
+                Err(_) => "Unknown error".to_owned(),
+            };
+
+            return AssertSnafu {
+                text,
+                scratch_space,
+            }
+            .fail();
+        }
+
+        Ok(Err(err)) => {
             let scratch_space = scratch.leave_it();
             return Err(err).context(FailureSnafu { scratch_space });
         }
@@ -182,7 +203,13 @@ enum TestError {
     #[snafu(display("Could not start the registry"))]
     RegistryStart { source: BoxError },
 
-    #[snafu(display("The test failed"))]
+    #[snafu(display("The test failed the assertion: {text}"))]
+    Assert {
+        text: String,
+        scratch_space: PathBuf,
+    },
+
+    #[snafu(display("The test returned an error"))]
     Failure {
         source: BoxError,
         scratch_space: PathBuf,
@@ -190,6 +217,17 @@ enum TestError {
 
     #[snafu(display("Could not shut down the registry"))]
     RegistryShutdown { source: BoxError },
+}
+
+impl TestError {
+    fn scratch_space(&self) -> Option<&Path> {
+        match self {
+            Self::Assert { scratch_space, .. } | Self::Failure { scratch_space, .. } => {
+                Some(scratch_space)
+            }
+            _ => None,
+        }
+    }
 }
 
 macro_rules! assert_downloaded_crates {
@@ -639,6 +677,38 @@ async fn platform_specific_dependency_used(
     Ok(())
 }
 
+async fn build_only_dependency(scratch: &ScratchSpace, registry: &mut impl Registry) -> BoxResult {
+    let registry_url = registry.registry_url().await;
+    let reg = CreatedRegistry::new("mine", registry_url);
+
+    let only_for_build = Crate::new("only-for-build", "1.0.0")
+        .lib_rs("pub const BUILD_ID: u8 = 1;")
+        .create_in(scratch)
+        .await?;
+    registry.publish_crate(&only_for_build).await?;
+
+    let library_crate = Crate::new("the-library", "1.0.0")
+        .add_registry(&reg)
+        .add_build_dependency(only_for_build.in_registry(&reg))
+        .build_script(r#"fn main() { println!("cargo::rustc-env=BUILD_ID_2={}", only_for_build::BUILD_ID); }"#)
+        .lib_rs(r#"pub const ID: &str = env!("BUILD_ID_2");"#)
+        .create_in(scratch)
+        .await?;
+    registry.publish_crate(&library_crate).await?;
+
+    let usage_crate = Crate::new("the-binary", "0.1.0")
+        .add_registry(&reg)
+        .add_dependency(library_crate.in_registry(&reg))
+        .main_rs(r#"fn main() { assert_eq!("1", the_library::ID); }"#)
+        .create_in(scratch)
+        .await?;
+
+    usage_crate.run().await?;
+    assert_downloaded_crates!(scratch, 2);
+
+    Ok(())
+}
+
 struct ScratchSpace {
     #[allow(unused)]
     root: TempDir,
@@ -951,6 +1021,7 @@ impl Crate {
                     rust_version: Default::default(),
                 },
                 dependencies: Default::default(),
+                build_dependencies: Default::default(),
                 features: Default::default(),
                 target: Default::default(),
             },
@@ -983,6 +1054,11 @@ impl Crate {
 
     fn add_dependency(mut self, dependency: impl DependencyDefinition) -> Self {
         Self::add_dependency_common(&mut self.cargo_toml.dependencies, dependency);
+        self
+    }
+
+    fn add_build_dependency(mut self, dependency: impl DependencyDefinition) -> Self {
+        Self::add_dependency_common(&mut self.cargo_toml.build_dependencies, dependency);
         self
     }
 
@@ -1328,9 +1404,11 @@ mod cargo_toml {
     pub type Dependencies = BTreeMap<String, Dependency>;
 
     #[derive(Debug, Serialize)]
+    #[serde(rename_all = "kebab-case")]
     pub struct Root {
         pub package: Package,
         pub dependencies: Dependencies,
+        pub build_dependencies: Dependencies,
         pub features: BTreeMap<String, Vec<String>>,
         pub target: BTreeMap<String, Target>,
     }
