@@ -3,6 +3,11 @@ name = "registry-conformance"
 version = "0.1.0"
 edition = "2021"
 
+license = "MIT OR Apache-2.0"
+
+description = "Behavioral tests for a Cargo registry"
+repository = "https://github.com/integer32llc/registry-conformance"
+
 [dependencies]
 futures = { version = "0.3.30", default-features = false, features = ["std"] }
 regex = { version = "1.10.4", default-features = false, features = ["std"] }
