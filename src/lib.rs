@@ -752,7 +752,7 @@ async fn build_only_dependency(scratch: &ScratchSpace, registry: &mut impl Regis
     Ok(())
 }
 
-struct ScratchSpace {
+pub struct ScratchSpace {
     #[allow(unused)]
     root: TempDir,
     cargo_home_path: PathBuf,
@@ -761,7 +761,7 @@ struct ScratchSpace {
 }
 
 impl ScratchSpace {
-    async fn new() -> Result<Self, ScratchSpaceError> {
+    pub async fn new() -> Result<Self, ScratchSpaceError> {
         use scratch_space_error::*;
 
         let root = TempDir::new().context(RootSnafu)?;
@@ -791,6 +791,22 @@ impl ScratchSpace {
             crates_path,
             registry_path,
         })
+    }
+
+    pub fn root(&self) -> &Path {
+        self.root.path()
+    }
+
+    pub fn cargo_home(&self) -> &Path {
+        &self.cargo_home_path
+    }
+
+    pub fn crates(&self) -> &Path {
+        &self.crates_path
+    }
+
+    pub fn registry(&self) -> &Path {
+        &self.registry_path
     }
 
     async fn downloaded_crates(&self) -> Result<usize, DownloadedCratesError> {
@@ -835,14 +851,14 @@ impl ScratchSpace {
         Ok(cnt)
     }
 
-    fn leave_it(self) -> PathBuf {
+    pub fn leave_it(self) -> PathBuf {
         self.root.into_path()
     }
 }
 
 #[derive(Debug, Snafu)]
 #[snafu(module)]
-enum ScratchSpaceError {
+pub enum ScratchSpaceError {
     #[snafu(display("Could not create the scratch space root"))]
     Root { source: std::io::Error },
 
@@ -1066,7 +1082,7 @@ impl RegistryDefinition for CreatedRegistry {
 }
 
 #[derive(Debug)]
-struct Crate {
+pub struct Crate {
     cargo_toml: cargo_toml::Root,
     src: BTreeMap<PathBuf, String>,
     dotcargo_config: Option<dotcargo_config::Root>,
@@ -1074,7 +1090,7 @@ struct Crate {
 }
 
 impl Crate {
-    fn new(name: impl Into<String>, version: impl Into<String>) -> Crate {
+    pub fn new(name: impl Into<String>, version: impl Into<String>) -> Crate {
         Self {
             cargo_toml: cargo_toml::Root {
                 package: cargo_toml::Package {
@@ -1095,17 +1111,17 @@ impl Crate {
         }
     }
 
-    fn lib_rs(mut self, contents: impl Into<String>) -> Self {
+    pub fn lib_rs(mut self, contents: impl Into<String>) -> Self {
         self.src.insert("lib.rs".into(), contents.into());
         self
     }
 
-    fn main_rs(mut self, contents: impl Into<String>) -> Self {
+    pub fn main_rs(mut self, contents: impl Into<String>) -> Self {
         self.src.insert("main.rs".into(), contents.into());
         self
     }
 
-    fn add_registry(mut self, registry: impl RegistryDefinition) -> Self {
+    pub fn add_registry(mut self, registry: impl RegistryDefinition) -> Self {
         let dotcargo_config = self.dotcargo_config.get_or_insert_with(Default::default);
         dotcargo_config.registries.insert(
             registry.name().to_owned(),
@@ -1116,17 +1132,17 @@ impl Crate {
         self
     }
 
-    fn add_dependency(mut self, dependency: impl DependencyDefinition) -> Self {
+    pub fn add_dependency(mut self, dependency: impl DependencyDefinition) -> Self {
         Self::add_dependency_common(&mut self.cargo_toml.dependencies, dependency);
         self
     }
 
-    fn add_build_dependency(mut self, dependency: impl DependencyDefinition) -> Self {
+    pub fn add_build_dependency(mut self, dependency: impl DependencyDefinition) -> Self {
         Self::add_dependency_common(&mut self.cargo_toml.build_dependencies, dependency);
         self
     }
 
-    fn add_target_dependency(
+    pub fn add_target_dependency(
         mut self,
         target: impl Into<String>,
         dependency: impl DependencyDefinition,
@@ -1161,7 +1177,7 @@ impl Crate {
         );
     }
 
-    fn add_feature(
+    pub fn add_feature(
         mut self,
         name: impl Into<String>,
         members: impl IntoIterator<Item = impl Into<String>>,
@@ -1172,22 +1188,22 @@ impl Crate {
         self
     }
 
-    fn links(mut self, links_key: impl Into<String>) -> Self {
+    pub fn links(mut self, links_key: impl Into<String>) -> Self {
         self.cargo_toml.package.links = Some(links_key.into());
         self
     }
 
-    fn build_script(mut self, contents: impl Into<String>) -> Self {
+    pub fn build_script(mut self, contents: impl Into<String>) -> Self {
         self.build_script = Some(contents.into());
         self
     }
 
-    fn rust_version(mut self, arg: impl Into<String>) -> Self {
+    pub fn rust_version(mut self, arg: impl Into<String>) -> Self {
         self.cargo_toml.package.rust_version = Some(arg.into());
         self
     }
 
-    async fn create_in(self, scratch: &ScratchSpace) -> Result<CreatedCrate, CreateCrateError> {
+    pub async fn create_in(self, scratch: &ScratchSpace) -> Result<CreatedCrate, CreateCrateError> {
         use create_crate_error::*;
 
         let mut crate_path = scratch.crates_path.join(&self.cargo_toml.package.name);
@@ -1261,7 +1277,7 @@ impl Crate {
 
 #[derive(Debug, Snafu)]
 #[snafu(module)]
-enum CreateCrateError {
+pub enum CreateCrateError {
     #[snafu(display("Could not create the crate directory {}", path.display()))]
     CrateCreate {
         source: std::io::Error,
@@ -1320,6 +1336,10 @@ pub struct CreatedCrate {
 }
 
 impl CreatedCrate {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
     pub async fn package(&self) -> Result<PathBuf, PackageError> {
         use package_error::*;
 
