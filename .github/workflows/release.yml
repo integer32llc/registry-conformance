@@ -1,0 +1,48 @@
+name: "Publish crate to our Margo registry"
+on:
+  push:
+    tags:
+      - "*"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Select Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Package crate
+        run: |-
+          set -eu
+
+          cargo package
+
+          mkdir /tmp/crates
+          mv ./target/package/*.crate /tmp/crates
+
+      - name: Checkout GitHub Pages
+        uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+
+      - name: Publish crate
+        uses: integer32llc/margo-actions@main
+        with:
+          crates: /tmp/crates/*.crate
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Commit and push to GitHub Pages
+        run: |-
+          set -eu
+
+          git config user.email "margo@integer32.com"
+          git config user.name "Margo GitHub Action"
+
+          git add .
+          git commit -m 'Publish ${{ github.event.ref }}'
+          git push origin gh-pages
