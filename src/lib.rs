@@ -20,9 +20,12 @@ use definition::{Dependency2, DependencyDefinition, RegistryDefinition};
 type BoxError = Box<dyn snafu::Error + Send + Sync + 'static>;
 type BoxResult<T = ()> = Result<T, BoxError>;
 
+type TestFunction<R> =
+    Box<dyn for<'a> FnOnce(&'a ScratchSpace, &'a mut R) -> BoxFuture<'a, BoxResult>>;
+
 struct TestDefinition<R: 'static> {
     name: &'static str,
-    f: Box<dyn for<'a> FnOnce(&'a ScratchSpace, &'a mut R) -> BoxFuture<'a, BoxResult>>,
+    f: TestFunction<R>,
 }
 
 #[derive(Debug)]
@@ -61,7 +64,7 @@ pub async fn test_conformance<R: Registry + Send + Sync + 'static>(
     mut args: impl Iterator<Item = String>,
 ) -> ExitCode {
     let selected_tests = match args.nth(1) {
-        Some(pattern) => Regex::new(&*pattern),
+        Some(pattern) => Regex::new(&pattern),
         None => Regex::new(".*"),
     }
     .unwrap();
@@ -870,10 +873,11 @@ impl ScratchSpace {
         };
 
         let mut cnt = 0;
-        while let Some(_) = d
+        while d
             .next_entry()
             .await
             .context(EnumerateRegistrySnafu { path: &cache_path })?
+            .is_some()
         {
             cnt += 1;
         }
