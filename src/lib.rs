@@ -87,6 +87,7 @@ pub async fn test_conformance<R: Registry + Send + Sync + 'static>(
         multiple_sibling_dependencies,
         multiple_hierarchical_dependencies,
         cross_registry_dependencies,
+        crates_io_dependencies_unify,
         multiple_versions,
         conflicting_links,
         minimum_version,
@@ -382,6 +383,35 @@ async fn cross_registry_dependencies(
         .add_registry(&reg)
         .add_dependency(library_crate.in_registry(&reg))
         .main_rs("fn main() { assert_eq!(2, the_library::iter(false).count()); }")
+        .create_in(scratch)
+        .await?;
+
+    usage_crate.run().await?;
+
+    Ok(())
+}
+
+async fn crates_io_dependencies_unify(
+    scratch: &ScratchSpace,
+    registry: &mut impl Registry,
+) -> BoxResult {
+    let registry_url = registry.registry_url().await;
+    let reg = CreatedRegistry::new("mine", registry_url);
+
+    let either_dep = ("either", "1.0");
+
+    let library_crate = Crate::new("the-library", "0.2.0")
+        .add_dependency(either_dep)
+        .lib_rs("pub fn consume(_: either::Either<(), ()>) {}")
+        .create_in(scratch)
+        .await?;
+    registry.publish_crate(&library_crate).await?;
+
+    let usage_crate = Crate::new("the-binary", "0.1.0")
+        .add_registry(&reg)
+        .add_dependency(library_crate.in_registry(&reg))
+        .add_dependency(either_dep)
+        .main_rs("fn main() { the_library::consume(either::Either::Left(())); }")
         .create_in(scratch)
         .await?;
 
