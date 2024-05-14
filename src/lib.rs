@@ -1,6 +1,7 @@
 #![deny(rust_2018_idioms)]
 #![deny(unused_crate_dependencies)]
 
+use base64::Engine;
 use futures::{future::BoxFuture, stream, FutureExt, StreamExt};
 use regex::Regex;
 use snafu::prelude::*;
@@ -103,6 +104,7 @@ pub async fn test_conformance<R: Registry + Send + Sync + 'static>(
         (Default::default, platform_specific_dependency_unused),
         (Default::default, platform_specific_dependency_used),
         (Default::default, build_only_dependency),
+        (authorization_required_setup, authorization_required),
     ];
 
     let tests = to_run.into_iter().map(|t| {
@@ -794,6 +796,39 @@ async fn build_only_dependency(scratch: &ScratchSpace, registry: &mut impl Regis
     Ok(())
 }
 
+fn authorization_required_setup<B: RegistryBuilder>() -> B {
+    B::default().enable_basic_auth("admin", "baseball123")
+}
+
+async fn authorization_required(scratch: &ScratchSpace, registry: &mut impl Registry) -> BoxResult {
+    let registry_url = registry.registry_url().await;
+    let reg = CreatedRegistry::new("mine", registry_url);
+
+    let library_crate = Crate::new("the-library", "1.0.0")
+        .add_registry(&reg)
+        .lib_rs(r#"pub const ID: u8 = 1;"#)
+        .create_in(scratch)
+        .await?;
+    registry.publish_crate(&library_crate).await?;
+
+    let usage_crate = Crate::new("the-binary", "0.1.0")
+        .add_registry(&reg)
+        .add_dependency(library_crate.in_registry(&reg))
+        .main_rs(r#"fn main() { assert_eq!(1, the_library::ID); }"#)
+        .create_in(scratch)
+        .await?;
+
+    usage_crate
+        .cargo()
+        .basic_auth_credentials(&reg, "admin", "baseball123")
+        .run()
+        .command()
+        .expect_success()
+        .await?;
+
+    Ok(())
+}
+
 pub struct ScratchSpace {
     #[allow(unused)]
     root: TempDir,
@@ -955,6 +990,8 @@ enum DownloadedCratesError {
 pub trait RegistryBuilder: Sized + Default {
     type Registry: Registry;
     type Error: snafu::Error + Send + Sync + 'static;
+
+    fn enable_basic_auth(self, username: &str, password: &str) -> Self;
 
     fn start(
         self,
@@ -1179,6 +1216,7 @@ impl Crate {
             registry.name().to_owned(),
             dotcargo_config::Registry {
                 index: registry.url().to_owned(),
+                credential_provider: vec!["cargo:token".into()],
             },
         );
         self
@@ -1423,6 +1461,7 @@ impl CreatedCrate {
             crate_: self,
             toolchain: Default::default(),
             msrv_resolver: Default::default(),
+            credentials: Default::default(),
             command: Default::default(),
             args: Default::default(),
         }
@@ -1453,6 +1492,7 @@ struct CargoCommandBuilder<'a> {
     crate_: &'a CreatedCrate,
     toolchain: Option<String>,
     msrv_resolver: bool,
+    credentials: Option<(String, String)>,
     command: Option<String>,
     args: Option<Vec<String>>,
 }
@@ -1465,6 +1505,22 @@ impl CargoCommandBuilder<'_> {
 
     fn enable_msrv_resolver(mut self) -> Self {
         self.msrv_resolver = true;
+        self
+    }
+
+    fn basic_auth_credentials(
+        mut self,
+        registry: &CreatedRegistry,
+        username: &str,
+        password: &str,
+    ) -> Self {
+        let name = registry.name().to_ascii_uppercase();
+
+        let creds = format!("{username}:{password}");
+        let mut token = String::from("Basic ");
+        base64::engine::general_purpose::STANDARD.encode_string(creds, &mut token);
+
+        self.credentials = Some((name, token));
         self
     }
 
@@ -1510,6 +1566,11 @@ impl CargoCommandBuilder<'_> {
             cmd.arg("-Zmsrv-policy");
         }
 
+        if let Some((name, credentials)) = self.credentials {
+            let name = format!("CARGO_REGISTRIES_{name}_TOKEN");
+            cmd.env(name, credentials);
+        }
+
         cmd
     }
 }
@@ -1534,8 +1595,10 @@ mod dotcargo_config {
     }
 
     #[derive(Debug, Serialize)]
+    #[serde(rename_all = "kebab-case")]
     pub struct Registry {
         pub index: String,
+        pub credential_provider: Vec<String>,
     }
 }
 
