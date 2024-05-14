@@ -23,8 +23,9 @@ type BoxResult<T = ()> = Result<T, BoxError>;
 type TestFunction<R> =
     Box<dyn for<'a> FnOnce(&'a ScratchSpace, &'a mut R) -> BoxFuture<'a, BoxResult>>;
 
-struct TestDefinition<R: 'static> {
+struct TestDefinition<R: Registry + 'static> {
     name: &'static str,
+    setup: Box<dyn FnOnce() -> R::Builder>,
     f: TestFunction<R>,
 }
 
@@ -70,11 +71,12 @@ pub async fn test_conformance<R: Registry + Send + Sync + 'static>(
     .unwrap();
 
     macro_rules! tests {
-        ($($name:ident),* $(,)?) => {
+        ($(($setup:expr, $name:ident)),* $(,)?) => {
             [
                 $(
                     TestDefinition {
                         name: stringify!($name),
+                        setup: Box::new($setup),
                         f: Box::new(|a, b: &mut R| $name(a, b).boxed()),
                     }
                 ,)*
@@ -83,34 +85,36 @@ pub async fn test_conformance<R: Registry + Send + Sync + 'static>(
     }
 
     let to_run = tests![
-        name_length_1,
-        name_length_2,
-        name_length_3,
-        name_length_4,
-        multiple_sibling_dependencies,
-        multiple_hierarchical_dependencies,
-        cross_registry_dependencies,
-        crates_io_dependencies_unify,
-        multiple_versions,
-        conflicting_links,
-        minimum_version,
-        optional_dependency_unused,
-        optional_dependency_used_implicit,
-        optional_dependency_used_implicit_renamed,
-        optional_dependency_used_explicit,
-        platform_specific_dependency_unused,
-        platform_specific_dependency_used,
-        build_only_dependency,
+        (Default::default, name_length_1),
+        (Default::default, name_length_2),
+        (Default::default, name_length_3),
+        (Default::default, name_length_4),
+        (Default::default, multiple_sibling_dependencies),
+        (Default::default, multiple_hierarchical_dependencies),
+        (Default::default, cross_registry_dependencies),
+        (Default::default, crates_io_dependencies_unify),
+        (Default::default, multiple_versions),
+        (Default::default, conflicting_links),
+        (Default::default, minimum_version),
+        (Default::default, optional_dependency_unused),
+        (Default::default, optional_dependency_used_implicit),
+        (Default::default, optional_dependency_used_implicit_renamed),
+        (Default::default, optional_dependency_used_explicit),
+        (Default::default, platform_specific_dependency_unused),
+        (Default::default, platform_specific_dependency_used),
+        (Default::default, build_only_dependency),
     ];
 
     let tests = to_run.into_iter().map(|t| {
         let should_run = selected_tests.is_match(t.name);
 
         async move {
-            let TestDefinition { name, f } = t;
+            let TestDefinition { name, setup, f } = t;
 
             let result = if should_run {
-                wrap_test::<R, _>(move |a, b| f(a, b)).await.into()
+                wrap_test::<R, _, _>(setup, move |a, b| f(a, b))
+                    .await
+                    .into()
             } else {
                 TestResultKind::Skipped
             };
@@ -150,15 +154,20 @@ pub async fn test_conformance<R: Registry + Send + Sync + 'static>(
     exit_code
 }
 
-async fn wrap_test<R, F>(f: F) -> Result<(), TestError>
+async fn wrap_test<R, S, F>(setup: S, f: F) -> Result<(), TestError>
 where
     R: Registry,
+    S: FnOnce() -> R::Builder,
     F: for<'a> FnOnce(&'a ScratchSpace, &'a mut R) -> BoxFuture<'a, BoxResult>,
 {
     use test_error::*;
 
     let scratch = ScratchSpace::new().await.context(ScratchSnafu)?;
-    let mut registry = R::start(&scratch.registry_path)
+
+    let builder = setup();
+
+    let mut registry = builder
+        .start(&scratch.registry_path)
         .await
         .boxed()
         .context(RegistryStartSnafu)?;
@@ -943,10 +952,19 @@ enum DownloadedCratesError {
     },
 }
 
-pub trait Registry: Sized {
+pub trait RegistryBuilder: Sized + Default {
+    type Registry: Registry;
     type Error: snafu::Error + Send + Sync + 'static;
 
-    fn start(path: impl Into<PathBuf>) -> impl Future<Output = Result<Self, Self::Error>>;
+    fn start(
+        self,
+        path: impl Into<PathBuf>,
+    ) -> impl Future<Output = Result<Self::Registry, Self::Error>>;
+}
+
+pub trait Registry: Sized {
+    type Builder: RegistryBuilder<Registry = Self>;
+    type Error: snafu::Error + Send + Sync + 'static;
 
     fn registry_url(&self) -> impl Future<Output = String> + Send;
 
