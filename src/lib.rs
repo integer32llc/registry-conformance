@@ -105,6 +105,7 @@ pub async fn test_conformance<R: Registry + Send + Sync + 'static>(
         (Default::default, platform_specific_dependency_used),
         (Default::default, build_only_dependency),
         (authorization_required_setup, authorization_required),
+        (Default::default, yank),
     ];
 
     let tests = to_run.into_iter().map(|t| {
@@ -829,6 +830,55 @@ async fn authorization_required(scratch: &ScratchSpace, registry: &mut impl Regi
     Ok(())
 }
 
+async fn yank(scratch: &ScratchSpace, registry: &mut impl Registry) -> BoxResult {
+    let registry_url = registry.registry_url().await;
+    let reg = CreatedRegistry::new("mine", registry_url);
+
+    let library_crate = Crate::new("the-library", "1.0.0")
+        .add_registry(&reg)
+        .lib_rs(r#"pub const ID: u8 = 1;"#)
+        .create_in(scratch)
+        .await?;
+    registry.publish_crate(&library_crate).await?;
+
+    let got_it_crate = Crate::new("got-it", "0.1.0")
+        .add_registry(&reg)
+        .add_dependency(library_crate.clone().in_registry(&reg))
+        .main_rs(r#"fn main() { assert_eq!(1, the_library::ID); }"#)
+        .create_in(scratch)
+        .await?;
+
+    let not_got_it_crate = Crate::new("not-got-it", "0.1.0")
+        .add_registry(&reg)
+        .add_dependency(library_crate.clone().in_registry(&reg))
+        .main_rs(r#"fn main() { assert_eq!(1, the_library::ID); }"#)
+        .create_in(scratch)
+        .await?;
+
+    // Lock the dependency.
+    got_it_crate.run().await?;
+
+    registry.yank_crate(&library_crate).await?;
+    // We might be fast enough that the `Last-Modified` header would
+    // not have updated yet (only one second granularity) so we delete
+    // the cache to force fetching the index again.
+    scratch.remove_index_cache().await?;
+
+    // After yanking, crates that already have the dependency can
+    // still get it.
+    got_it_crate.clean().await?;
+    got_it_crate.run().await?;
+    // Other crates will fail
+    not_got_it_crate
+        .cargo()
+        .run()
+        .command()
+        .expect_failure()
+        .await?;
+
+    Ok(())
+}
+
 pub struct ScratchSpace {
     #[allow(unused)]
     root: TempDir,
@@ -889,26 +939,9 @@ impl ScratchSpace {
     async fn downloaded_crates(&self) -> Result<usize, DownloadedCratesError> {
         use downloaded_crates_error::*;
 
-        let mut cache_path = self.cargo_home_path.join("registry");
-        cache_path.push("cache");
-
-        let mut d = match fs::read_dir(&cache_path).await {
-            Ok(d) => d,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
-            Err(e) => return Err(e).context(OpenCacheSnafu { path: cache_path }),
+        let Some(cache_path) = self.enter_registry_directory("cache").await? else {
+            return Ok(0);
         };
-
-        let mut reg = None;
-        while let Some(entry) = d
-            .next_entry()
-            .await
-            .context(EnumerateCacheSnafu { path: &cache_path })?
-        {
-            assert!(reg.is_none(), "Too many registries here");
-            reg = Some(entry.file_name());
-        }
-        let Some(reg) = reg else { return Ok(0) };
-        cache_path.push(reg);
 
         let mut d = match fs::read_dir(&cache_path).await {
             Ok(d) => d,
@@ -927,6 +960,52 @@ impl ScratchSpace {
         }
 
         Ok(cnt)
+    }
+
+    async fn remove_index_cache(&self) -> Result<(), DownloadedCratesError> {
+        use downloaded_crates_error::*;
+
+        let Some(mut cache_path) = self.enter_registry_directory("index").await? else {
+            return Ok(());
+        };
+
+        cache_path.push(".cache");
+
+        match fs::remove_dir_all(&cache_path).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).context(OpenRegistrySnafu { path: cache_path }),
+        }
+    }
+
+    async fn enter_registry_directory(
+        &self,
+        subdirectory: impl AsRef<Path>,
+    ) -> Result<Option<PathBuf>, EnterError> {
+        use enter_error::*;
+
+        let mut sub_path = self.cargo_home_path.join("registry");
+        sub_path.push(subdirectory);
+
+        let mut d = match fs::read_dir(&sub_path).await {
+            Ok(d) => d,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).context(OpenSnafu { path: sub_path }),
+        };
+
+        let mut reg = None;
+        while let Some(entry) = d
+            .next_entry()
+            .await
+            .context(EnumerateSnafu { path: &sub_path })?
+        {
+            ensure!(reg.is_none(), TooManySnafu { path: &sub_path });
+            reg = Some(entry.file_name());
+        }
+        let Some(reg) = reg else { return Ok(None) };
+        sub_path.push(reg);
+
+        Ok(Some(sub_path))
     }
 
     pub fn leave_it(self) -> PathBuf {
@@ -962,17 +1041,9 @@ pub enum ScratchSpaceError {
 #[derive(Debug, Snafu)]
 #[snafu(module)]
 enum DownloadedCratesError {
-    #[snafu(display("Could not open the cache directory {}", path.display()))]
-    OpenCache {
-        source: std::io::Error,
-        path: PathBuf,
-    },
-
-    #[snafu(display("Could not enumerate the cache directory {}", path.display()))]
-    EnumerateCache {
-        source: std::io::Error,
-        path: PathBuf,
-    },
+    #[snafu(display("Could not find the registry's cache directory"))]
+    #[snafu(context(false))]
+    Enter { source: EnterError },
 
     #[snafu(display("Could not open the registry directory {}", path.display()))]
     OpenRegistry {
@@ -985,6 +1056,25 @@ enum DownloadedCratesError {
         source: std::io::Error,
         path: PathBuf,
     },
+}
+
+#[derive(Debug, Snafu)]
+#[snafu(module)]
+enum EnterError {
+    #[snafu(display("Could not open the directory {}", path.display()))]
+    Open {
+        source: std::io::Error,
+        path: PathBuf,
+    },
+
+    #[snafu(display("Could not enumerate the directory {}", path.display()))]
+    Enumerate {
+        source: std::io::Error,
+        path: PathBuf,
+    },
+
+    #[snafu(display("Multiple registries found in the directory {}", path.display()))]
+    TooMany { path: PathBuf },
 }
 
 pub trait RegistryBuilder: Sized + Default {
@@ -1006,6 +1096,11 @@ pub trait Registry: Sized {
     fn registry_url(&self) -> impl Future<Output = String> + Send;
 
     fn publish_crate(
+        &mut self,
+        crate_: &CreatedCrate,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    fn yank_crate(
         &mut self,
         crate_: &CreatedCrate,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
@@ -1417,7 +1512,7 @@ pub enum CreateCrateError {
     },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CreatedCrate {
     cargo_home: PathBuf,
     directory: PathBuf,
@@ -1428,6 +1523,10 @@ pub struct CreatedCrate {
 impl CreatedCrate {
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    pub fn version(&self) -> &str {
+        &self.version
     }
 
     pub async fn package(&self) -> Result<PathBuf, PackageError> {
@@ -1454,6 +1553,10 @@ impl CreatedCrate {
 
     async fn run(&self) -> Result<CommandOutput, CommandError> {
         self.cargo().run().command().expect_success().await
+    }
+
+    async fn clean(&self) -> Result<CommandOutput, CommandError> {
+        self.cargo().clean().command().expect_success().await
     }
 
     fn cargo(&self) -> CargoCommandBuilder<'_> {
@@ -1531,6 +1634,11 @@ impl CargoCommandBuilder<'_> {
 
     fn run(mut self) -> Self {
         self.command = Some("run".into());
+        self
+    }
+
+    fn clean(mut self) -> Self {
+        self.command = Some("clean".into());
         self
     }
 
