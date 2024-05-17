@@ -106,6 +106,7 @@ pub async fn test_conformance<R: Registry + Send + Sync + 'static>(
         (Default::default, build_only_dependency),
         (authorization_required_setup, authorization_required),
         (Default::default, yank),
+        (Default::default, unyank),
     ];
 
     let tests = to_run.into_iter().map(|t| {
@@ -859,6 +860,8 @@ async fn yank(scratch: &ScratchSpace, registry: &mut impl Registry) -> BoxResult
     got_it_crate.run().await?;
 
     registry.yank_crate(&library_crate).await?;
+    // [CACHE-YANK]
+    //
     // We might be fast enough that the `Last-Modified` header would
     // not have updated yet (only one second granularity) so we delete
     // the cache to force fetching the index again.
@@ -875,6 +878,37 @@ async fn yank(scratch: &ScratchSpace, registry: &mut impl Registry) -> BoxResult
         .command()
         .expect_failure()
         .await?;
+
+    Ok(())
+}
+
+async fn unyank(scratch: &ScratchSpace, registry: &mut impl Registry) -> BoxResult {
+    let registry_url = registry.registry_url().await;
+    let reg = CreatedRegistry::new("mine", registry_url);
+
+    let library_crate = Crate::new("the-library", "1.0.0")
+        .add_registry(&reg)
+        .lib_rs(r#"pub const ID: u8 = 1;"#)
+        .create_in(scratch)
+        .await?;
+    registry.publish_crate(&library_crate).await?;
+
+    let usage_crate = Crate::new("got-it", "0.1.0")
+        .add_registry(&reg)
+        .add_dependency(library_crate.clone().in_registry(&reg))
+        .main_rs(r#"fn main() { assert_eq!(1, the_library::ID); }"#)
+        .create_in(scratch)
+        .await?;
+
+    registry.yank_crate(&library_crate).await?;
+    scratch.remove_index_cache().await?; // See [CACHE-YANK]
+
+    usage_crate.cargo().run().command().expect_failure().await?;
+
+    registry.unyank_crate(&library_crate).await?;
+    scratch.remove_index_cache().await?; // See [CACHE-YANK]
+
+    usage_crate.run().await?;
 
     Ok(())
 }
@@ -1101,6 +1135,11 @@ pub trait Registry: Sized {
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     fn yank_crate(
+        &mut self,
+        crate_: &CreatedCrate,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    fn unyank_crate(
         &mut self,
         crate_: &CreatedCrate,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
