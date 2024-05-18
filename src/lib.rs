@@ -107,6 +107,7 @@ pub async fn test_conformance<R: Registry + Send + Sync + 'static>(
         (authorization_required_setup, authorization_required),
         (Default::default, yank),
         (Default::default, unyank),
+        (Default::default, remove),
     ];
 
     let tests = to_run.into_iter().map(|t| {
@@ -913,6 +914,41 @@ async fn unyank(scratch: &ScratchSpace, registry: &mut impl Registry) -> BoxResu
     Ok(())
 }
 
+async fn remove(scratch: &ScratchSpace, registry: &mut impl Registry) -> BoxResult {
+    let registry_url = registry.registry_url().await;
+    let reg = CreatedRegistry::new("mine", registry_url);
+
+    let library_crate = Crate::new("the-library", "1.0.0")
+        .add_registry(&reg)
+        .lib_rs(r#"pub const ID: u8 = 1;"#)
+        .create_in(scratch)
+        .await?;
+    registry.publish_crate(&library_crate).await?;
+
+    let usage_crate = Crate::new("got-it", "0.1.0")
+        .add_registry(&reg)
+        .add_dependency(library_crate.clone().in_registry(&reg))
+        .main_rs(r#"fn main() { assert_eq!(1, the_library::ID); }"#)
+        .create_in(scratch)
+        .await?;
+
+    // Lock the dependency.
+    usage_crate.run().await?;
+
+    registry.remove_crate(&library_crate).await?;
+
+    // In contrast to yanking, crates that depend on a removed
+    // dependency will no longer be able to download it. Mimic
+    // building on a new machine that has neither downloaded or built
+    // the dependency before.
+    scratch.remove_index_cache().await?;
+    usage_crate.clean().await?;
+
+    usage_crate.cargo().run().command().expect_failure().await?;
+
+    Ok(())
+}
+
 pub struct ScratchSpace {
     #[allow(unused)]
     root: TempDir,
@@ -1130,6 +1166,11 @@ pub trait Registry: Sized {
     fn registry_url(&self) -> impl Future<Output = String> + Send;
 
     fn publish_crate(
+        &mut self,
+        crate_: &CreatedCrate,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    fn remove_crate(
         &mut self,
         crate_: &CreatedCrate,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
