@@ -1748,8 +1748,8 @@ impl CargoCommandBuilder<'_> {
 
         if self.msrv_resolver {
             cmd.env(
-                "CARGO_RESOLVER_SOMETHING_LIKE_PRECEDENCE",
-                "something-like-rust-version",
+                "CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS",
+                "fallback",
             );
             cmd.arg("-Zmsrv-policy");
         }
