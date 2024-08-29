@@ -1747,10 +1747,7 @@ impl CargoCommandBuilder<'_> {
         }
 
         if self.msrv_resolver {
-            cmd.env(
-                "CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS",
-                "fallback",
-            );
+            cmd.env("CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS", "fallback");
             cmd.arg("-Zmsrv-policy");
         }
 
