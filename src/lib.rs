@@ -8,7 +8,7 @@ use snafu::prelude::*;
 use std::{
     collections::BTreeMap,
     future::Future,
-    io,
+    io, iter,
     panic::AssertUnwindSafe,
     path::{Path, PathBuf},
     process::{self, ExitCode},
@@ -104,6 +104,8 @@ pub async fn test_conformance<R: Registry + Send + Sync + 'static>(
         (Default::default, platform_specific_dependency_unused),
         (Default::default, platform_specific_dependency_used),
         (Default::default, build_only_dependency),
+        (Default::default, dev_only_dependency_with_feature),
+        (Default::default, regular_and_dev_dependency_with_feature),
         (authorization_required_setup, authorization_required),
         (Default::default, yank),
         (Default::default, unyank),
@@ -799,6 +801,78 @@ async fn build_only_dependency(scratch: &ScratchSpace, registry: &mut impl Regis
     Ok(())
 }
 
+async fn dev_only_dependency_with_feature(
+    scratch: &ScratchSpace,
+    registry: &mut impl Registry,
+) -> BoxResult {
+    let registry_url = registry.registry_url().await;
+    let reg = CreatedRegistry::new("mine", registry_url);
+
+    let library_crate = Crate::new("the-library", "1.0.0")
+        .add_registry(&reg)
+        .add_dev_dependency(("not-published", "1.0.0"))
+        .lib_rs(r#"pub const ID: u8 = 1;"#)
+        .add_feature("default", ["not-published/target"])
+        .create_in(scratch)
+        .await?;
+    registry.publish_crate(&library_crate).await?;
+
+    let usage_crate = Crate::new("the-binary", "0.1.0")
+        .add_registry(&reg)
+        .add_dependency(library_crate.in_registry(&reg))
+        .main_rs(r#"fn main() { assert_eq!(1, the_library::ID); }"#)
+        .create_in(scratch)
+        .await?;
+
+    usage_crate.run().await?;
+    assert_downloaded_crates!(scratch, 1);
+
+    Ok(())
+}
+
+async fn regular_and_dev_dependency_with_feature(
+    scratch: &ScratchSpace,
+    registry: &mut impl Registry,
+) -> BoxResult {
+    let registry_url = registry.registry_url().await;
+    let reg = CreatedRegistry::new("mine", registry_url);
+
+    let used_twice = Crate::new("used-twice", "0.0.1")
+        .add_registry(&reg)
+        .add_feature("target", iter::empty::<String>())
+        .lib_rs(
+            r#"
+            #[cfg(not(feature = "target"))] pub const ID: u8 = 100;
+            #[cfg(feature = "target")] pub const ID: u8 = 1;
+        "#,
+        )
+        .create_in(scratch)
+        .await?;
+    registry.publish_crate(&used_twice).await?;
+
+    let library_crate = Crate::new("the-library", "1.0.0")
+        .add_registry(&reg)
+        .add_dependency(used_twice.clone().in_registry(&reg))
+        .add_dev_dependency(used_twice.in_registry(&reg))
+        .lib_rs(r#"pub const ID: u8 = used_twice::ID * 2;"#)
+        .add_feature("default", ["used-twice/target"])
+        .create_in(scratch)
+        .await?;
+    registry.publish_crate(&library_crate).await?;
+
+    let usage_crate = Crate::new("the-binary", "0.1.0")
+        .add_registry(&reg)
+        .add_dependency(library_crate.in_registry(&reg))
+        .main_rs(r#"fn main() { assert_eq!(2, the_library::ID); }"#)
+        .create_in(scratch)
+        .await?;
+
+    usage_crate.run().await?;
+    assert_downloaded_crates!(scratch, 2);
+
+    Ok(())
+}
+
 fn authorization_required_setup<B: RegistryBuilder>() -> B {
     B::default().enable_basic_auth("admin", "baseball123")
 }
@@ -1366,6 +1440,7 @@ impl Crate {
                 },
                 dependencies: Default::default(),
                 build_dependencies: Default::default(),
+                dev_dependencies: Default::default(),
                 features: Default::default(),
                 target: Default::default(),
             },
@@ -1404,6 +1479,11 @@ impl Crate {
 
     pub fn add_build_dependency(mut self, dependency: impl DependencyDefinition) -> Self {
         Self::add_dependency_common(&mut self.cargo_toml.build_dependencies, dependency);
+        self
+    }
+
+    fn add_dev_dependency(mut self, dependency: impl DependencyDefinition) -> Self {
+        Self::add_dependency_common(&mut self.cargo_toml.dev_dependencies, dependency);
         self
     }
 
@@ -1799,6 +1879,7 @@ mod cargo_toml {
         pub package: Package,
         pub dependencies: Dependencies,
         pub build_dependencies: Dependencies,
+        pub dev_dependencies: Dependencies,
         pub features: BTreeMap<String, Vec<String>>,
         pub target: BTreeMap<String, Target>,
     }
