@@ -1811,7 +1811,9 @@ impl CargoCommandBuilder<'_> {
     fn command(self) -> Command {
         let mut cmd = Command::new("cargo");
 
-        let toolchain = self.toolchain.as_deref().unwrap_or("stable");
+        let default_toolchain = env::var("REGISTRY_CONFORMANCE_DEFAULT_TOOLCHAIN");
+        let default_toolchain = default_toolchain.as_deref().unwrap_or("stable");
+        let toolchain = self.toolchain.as_deref().unwrap_or(default_toolchain);
 
         cmd.current_dir(&self.crate_.directory)
             .env("CARGO_HOME", &self.crate_.cargo_home)
