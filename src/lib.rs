@@ -7,6 +7,7 @@ use regex::Regex;
 use snafu::prelude::*;
 use std::{
     collections::BTreeMap,
+    env,
     future::Future,
     io, iter,
     panic::AssertUnwindSafe,
@@ -104,7 +105,7 @@ pub async fn test_conformance<R: Registry + Send + Sync + 'static>(
         (Default::default, platform_specific_dependency_unused),
         (Default::default, platform_specific_dependency_used),
         (Default::default, build_only_dependency),
-        (Default::default, dev_only_dependency_with_feature),
+        // (Default::default, dev_only_dependency_with_feature),
         (Default::default, regular_and_dev_dependency_with_feature),
         (authorization_required_setup, authorization_required),
         (Default::default, yank),
@@ -801,6 +802,8 @@ async fn build_only_dependency(scratch: &ScratchSpace, registry: &mut impl Regis
     Ok(())
 }
 
+// Disabled as of Rust 1.84
+#[expect(dead_code, reason = "https://github.com/rust-lang/cargo/issues/15059")]
 async fn dev_only_dependency_with_feature(
     scratch: &ScratchSpace,
     registry: &mut impl Registry,
